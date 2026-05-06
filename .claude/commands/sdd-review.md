@@ -1,6 +1,6 @@
 Review the current implementation against:
 - CLAUDE.md
-- docs/specs/001-rosbot-navigation.md
+- .claude/specs/001-rosbot-navigation.md
 - the latest approved milestone
 
 Check for:

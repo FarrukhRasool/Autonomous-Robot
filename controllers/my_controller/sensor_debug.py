@@ -70,6 +70,20 @@ def is_plausible(name, value):
             return False
         w, h, px = value
         return w > 0 and h > 0 and px is not None and all(0 <= c <= 255 for c in px)
+    if name == "colors":
+        if not isinstance(value, dict):
+            return False
+        return all(
+            key in value for key in
+            (
+                "green", "green_ratio", "green_distance",
+                "blue", "blue_ratio", "yellow", "yellow_ratio",
+            )
+        )
+    
+    if name in ("overhead_left", "overhead_center", "overhead_right"):
+        return value is not None and isinstance(value, (int, float))
+
     if name == "cam_depth":
         if not value:
             return False
@@ -183,6 +197,20 @@ def format_sensor_snapshot(readings):
             f"  {_ok(is_plausible('cam_rgb', v))}"
         )
 
+    colors = readings.get("colors")
+    if colors is None:
+        lines.append("  colors    : [MISS]")
+    else:
+        green_dist = colors["green_distance"]
+        green_dist_str = f"{green_dist:.3f}m" if _fin(green_dist) else "?"
+        lines.append(
+            f"  colors    : green={colors['green']}:{colors['green_ratio']:.3f}"
+            f" dist={green_dist_str}"
+            f"  blue={colors['blue']}:{colors['blue_ratio']:.3f}"
+            f"  yellow={colors['yellow']}:{colors['yellow_ratio']:.3f}"
+            f"  {_ok(is_plausible('colors', colors))}"
+        )
+
     v = readings.get("cam_depth")
     if v is None:
         lines.append("  depth     : [MISS]")
@@ -192,6 +220,19 @@ def format_sensor_snapshot(readings):
         lines.append(
             f"  depth     : {w}x{h}  center={ctr_str}"
             f"  {_ok(is_plausible('cam_depth', v))}"
+        )
+
+        overhead_left = readings.get("overhead_left")
+        overhead_center = readings.get("overhead_center")
+        overhead_right = readings.get("overhead_right")
+
+        def fmt_overhead(v):
+            return f"{v:.3f}m" if _fin(v) else str(v)
+
+        lines.append(
+            f"  overhead  : left={fmt_overhead(overhead_left)}"
+            f"  center={fmt_overhead(overhead_center)}"
+            f"  right={fmt_overhead(overhead_right)}"
         )
 
     lines.append("=" * 46)
@@ -218,9 +259,19 @@ def format_compact_sensors(readings):
     rfl_str = f"{rfl:.3f}m" if _fin(rfl) else "?"
     rfr_str = f"{rfr:.3f}m" if _fin(rfr) else "?"
 
+    colors = readings.get("colors") or {}
+    green_dist = colors.get("green_distance")
+    green_dist_str = f"{green_dist:.2f}m" if _fin(green_dist) else "?"
+    color_str = (
+        f"  green={colors.get('green', '?')}:{green_dist_str}"
+        f"  blue={colors.get('blue', '?')}"
+        f"  yellow={colors.get('yellow', '?')}"
+    )
+
     return (
         f"[SENS] enc_fl={enc_str}rad"
         f"  yaw={yaw_str}"
         f"  laser_min={lmin_str}"
         f"  rng_fl={rfl_str}  rng_fr={rfr_str}"
+        f"{color_str}"
     )
