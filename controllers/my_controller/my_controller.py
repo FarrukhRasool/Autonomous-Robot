@@ -9,7 +9,7 @@ Keys: F/S/A/D drive | Space stop | T self-test | G autonomous | I snapshot | L l
 import devices                          # hardware init (must import first)
 import sensors
 import motion
-from autonomous import autonomous_step
+from autonomous import autonomous_step, reset_autonomous_state
 from sensor_debug import format_compact_sensors, format_sensor_snapshot
 from config import TARGET_LIN_VEL, TARGET_ANG_VEL, FRONT_STOP_DIST
 
@@ -25,6 +25,13 @@ print(
     "Controller ready.  Keys: F/S/A/D drive | Space stop | T self-test | "
     "G autonomous mode | I sensor snapshot | L toggle sensor log"
 )
+
+
+OVERHEAD_CENTER_BLOCK_DIST = 0.55
+OVERHEAD_SIDE_WARN_DIST = 0.40
+OVERHEAD_SLOW_VEL = 0.04
+OVERHEAD_STEER_OMEGA = 0.12
+
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 while devices.robot.step(devices.timestep) != -1:
@@ -54,6 +61,7 @@ while devices.robot.step(devices.timestep) != -1:
         auto_mode = not auto_mode
         if not auto_mode:
             block_timer = 0
+            reset_autonomous_state()
         print(f"Autonomous mode {'ON' if auto_mode else 'OFF'}")
 
     # ── Hard stop: Space exits autonomous mode and zeroes twist ───────────────
@@ -62,6 +70,7 @@ while devices.robot.step(devices.timestep) != -1:
         if auto_mode:
             auto_mode   = False
             block_timer = 0
+            reset_autonomous_state()
             print("Autonomous mode OFF (Space pressed)")
 
     # ── Autonomous or teleop (mutually exclusive) ─────────────────────────────
@@ -70,9 +79,12 @@ while devices.robot.step(devices.timestep) != -1:
 
         if step_count % 10 == 0:
             print(
-                f"[DEPTH] front={dbg['depth_front']:.3f} "
-                f"caution={dbg['depth_caution']} block={dbg['depth_blocked']} "
-                f"emg={dbg['depth_emg']} block_timer={dbg['block_timer']} | "
+                f"[COLOR] green={dbg['green']}:{dbg['green_ratio']:.3f} "
+                f"dist={dbg['green_distance']:.3f} "
+                f"blue={dbg['blue']}:{dbg['blue_ratio']:.3f} "
+                f"yellow={dbg['yellow']}:{dbg['yellow_ratio']:.3f} | "
+                f"overhead={dbg['overhead_front']:.3f} "
+                f"block_timer={dbg['block_timer']} | "
                 f"{sel_label} v={v_cmd:+.2f} omega={omega_cmd:+.2f}"
             )
 
@@ -87,16 +99,7 @@ while devices.robot.step(devices.timestep) != -1:
             omega_cmd = TARGET_ANG_VEL
         elif ord('D') in pressed_now or ord('d') in pressed_now:
             omega_cmd = -TARGET_ANG_VEL
-
-    # ── Motor self-test: T drives forward for 2 s ─────────────────────────────
-    if (ord('T') in new_keys or ord('t') in new_keys) and test_timer == 0:
-        if auto_mode:
-            auto_mode   = False
-            block_timer = 0
-            print("Autonomous mode OFF (motor self-test starting)")
-        test_timer = int(2000 / max(1, devices.timestep))
-        print(f"Starting 2 s motor test at v={TARGET_LIN_VEL:.2f} m/s")
-
+    
     if test_timer > 0:
         v_cmd, omega_cmd = TARGET_LIN_VEL, 0.0
         test_timer -= 1
@@ -109,13 +112,3 @@ while devices.robot.step(devices.timestep) != -1:
 
     # ── Apply twist ────────────────────────────────────────────────────────────
     v_real, omega_real, wL, wR = motion.drive_twist(v_cmd, omega_cmd)
-
-    if step_count % 10 == 0:
-        mode_str = f"AUTO:{sel_label}" if auto_mode else "TELE"
-        print(
-            f"step={step_count} [{mode_str}] "
-            f"cmd v={v_real:+.2f} m/s omega={omega_real:+.2f} rad/s "
-            f"-> wL={wL:+.2f} wR={wR:+.2f} rad/s"
-        )
-        if sensor_log:
-            print(format_compact_sensors(sensors.read_sensor_snapshot()))
