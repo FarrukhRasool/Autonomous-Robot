@@ -136,6 +136,36 @@ def _read_scalar(sensor):
         return None
 
 
+def read_wheel_angles():
+    """Return (left_rad, right_rad) — averaged cumulative wheel angles.
+
+    Front and rear wheels on the same side share a motor command, so their
+    encoders should agree closely; the average is robust to small jitter.
+    Returns (None, None) if any encoder is unavailable.
+    """
+    fl = _read_scalar(devices.fl_wheel_sensor)
+    fr = _read_scalar(devices.fr_wheel_sensor)
+    rl = _read_scalar(devices.rl_wheel_sensor)
+    rr = _read_scalar(devices.rr_wheel_sensor)
+    if fl is None or fr is None or rl is None or rr is None:
+        return None, None
+    return 0.5 * (fl + rl), 0.5 * (fr + rr)
+
+
+def read_imu_yaw():
+    """Return the inertial-unit yaw in radians, or None if unavailable.
+
+    Webots' InertialUnit returns absolute world-frame roll/pitch/yaw; we
+    take element [2].  No baseline subtraction here — that belongs to the
+    pose layer, which captures a baseline on reset.
+    """
+    rpy = _read_vector(devices.inertial_unit, "getRollPitchYaw")
+    if rpy is None:
+        return None
+    yaw = rpy[2]
+    return yaw if math.isfinite(yaw) else None
+
+
 def _read_vector(sensor, method):
     value = _safe_call(sensor, method)
     return tuple(value) if value is not None else None
