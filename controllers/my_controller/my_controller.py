@@ -3,15 +3,21 @@
 Imports all subsystems and runs the Webots control loop.
 Contains no sensor reads, kinematics, or navigation logic.
 
-Keys: F/S/A/D drive | Space stop | T self-test | G autonomous | I snapshot | L log
+Keys: F/S/A/D drive | Space stop | T self-test | G autonomous |
+      I snapshot | L log | O pose | R reset pose & map | M map summary
 """
 
 import devices                          # hardware init (must import first)
 import sensors
 import motion
+import localization
+import mapping
 from autonomous import autonomous_step, reset_autonomous_state
 from sensor_debug import format_compact_sensors, format_sensor_snapshot
-from config import TARGET_LIN_VEL, TARGET_ANG_VEL, FRONT_STOP_DIST
+from config import (
+    TARGET_LIN_VEL, TARGET_ANG_VEL, FRONT_STOP_DIST,
+    POSE_LOG_PERIOD_STEPS,
+)
 
 # ── Controller state ───────────────────────────────────────────────────────────
 step_count       = 0
@@ -23,7 +29,8 @@ block_timer      = 0
 
 print(
     "Controller ready.  Keys: F/S/A/D drive | Space stop | T self-test | "
-    "G autonomous mode | I sensor snapshot | L toggle sensor log"
+    "G autonomous mode | I sensor snapshot | L toggle sensor log | "
+    "O pose snapshot | R reset pose & map | M map summary"
 )
 
 
@@ -36,6 +43,15 @@ OVERHEAD_STEER_OMEGA = 0.12
 # ── Main loop ──────────────────────────────────────────────────────────────────
 while devices.robot.step(devices.timestep) != -1:
     step_count += 1
+
+    # ── Odometry update (runs every step, before any control logic) ───────────
+    left_rad, right_rad = sensors.read_wheel_angles()
+    imu_yaw             = sensors.read_imu_yaw()
+    localization.update_from_encoders(left_rad, right_rad, imu_yaw)
+
+    # ── Mapping update — stamp the cell containing the robot as FREE ─────────
+    robot_x, robot_y, _ = localization.get_pose()
+    mapping.mark_visited_from_pose(robot_x, robot_y)
 
     # Keyboard edge detection: new_keys fires only on the step a key first appears
     pressed_now = set()
@@ -56,6 +72,18 @@ while devices.robot.step(devices.timestep) != -1:
     if ord('L') in new_keys or ord('l') in new_keys:
         sensor_log = not sensor_log
         print(f"Sensor logging {'ON' if sensor_log else 'OFF'}")
+
+    if ord('O') in new_keys or ord('o') in new_keys:
+        print(f"[POSE] {localization.format_pose()}")
+
+    if ord('R') in new_keys or ord('r') in new_keys:
+        localization.reset_pose()
+        mapping.clear()
+        print("[POSE] reset to (0, 0, 0); map cleared")
+
+    if ord('M') in new_keys or ord('m') in new_keys:
+        rx, ry, _ = localization.get_pose()
+        print(mapping.summary(robot_xy=(rx, ry)))
 
     if ord('G') in new_keys or ord('g') in new_keys:
         auto_mode = not auto_mode
@@ -112,3 +140,7 @@ while devices.robot.step(devices.timestep) != -1:
 
     # ── Apply twist ────────────────────────────────────────────────────────────
     v_real, omega_real, wL, wR = motion.drive_twist(v_cmd, omega_cmd)
+
+    # ── Periodic pose log ─────────────────────────────────────────────────────
+    if step_count % POSE_LOG_PERIOD_STEPS == 0:
+        print(f"[POSE] {localization.format_pose()}")

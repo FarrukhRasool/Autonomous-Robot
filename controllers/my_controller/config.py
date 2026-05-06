@@ -38,3 +38,10 @@ TARGET_PIXEL_RATIO = 0.03  # center ROI fraction that means pillar visible
 GREEN_DEPTH_MIN_VALID = 0.03  # m — reject only zero/near-zero green depth pixels
 GREEN_STOP_DIST    = 0.35  # m — green is too close; stop and turn away
 GREEN_CAUTION_DIST = 0.75  # m — green ahead; slow down and steer away
+
+# ── Localization ──────────────────────────────────────────────────────────────
+POSE_LOG_PERIOD_STEPS = 50  # steps between automatic pose log lines
+
+# ── Mapping ───────────────────────────────────────────────────────────────────
+GRID_RES_M         = 0.10  # m/cell
+GRID_HALF_EXTENT_M = 10.0  # m — grid spans (-half, +half) in both world axes
