@@ -166,6 +166,27 @@ def read_imu_yaw():
     return yaw if math.isfinite(yaw) else None
 
 
+def read_laser_scan():
+    """Return (ranges, fov_rad, max_range_m) for the laser, or (None, None, None).
+
+    `ranges` is the raw range image (index 0 = leftmost ray, matching
+    reactive.py's sector convention).  Caller is responsible for
+    rejecting inf, near-zero, and near-max-range readings.
+    """
+    laser = devices.laser
+    if laser is None:
+        return None, None, None
+    try:
+        ranges = laser.getRangeImage()
+        fov = laser.getFov()
+        max_range = laser.getMaxRange()
+    except Exception:
+        return None, None, None
+    if not ranges or fov is None or max_range is None:
+        return None, None, None
+    return ranges, fov, max_range
+
+
 def _read_vector(sensor, method):
     value = _safe_call(sensor, method)
     return tuple(value) if value is not None else None
