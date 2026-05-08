@@ -17,6 +17,7 @@ from sensor_debug import format_compact_sensors, format_sensor_snapshot
 from config import (
     TARGET_LIN_VEL, TARGET_ANG_VEL, FRONT_STOP_DIST,
     POSE_LOG_PERIOD_STEPS,
+    LASER_RANGE_REJECT_MARGIN_M,
 )
 
 # ── Controller state ───────────────────────────────────────────────────────────
@@ -43,15 +44,25 @@ OVERHEAD_STEER_OMEGA = 0.12
 # ── Main loop ──────────────────────────────────────────────────────────────────
 while devices.robot.step(devices.timestep) != -1:
     step_count += 1
-
+    reset_this_step = False
     # ── Odometry update (runs every step, before any control logic) ───────────
     left_rad, right_rad = sensors.read_wheel_angles()
     imu_yaw             = sensors.read_imu_yaw()
     localization.update_from_encoders(left_rad, right_rad, imu_yaw)
 
-    # ── Mapping update — stamp the cell containing the robot as FREE ─────────
-    robot_x, robot_y, _ = localization.get_pose()
+    # ── Mapping update ────────────────────────────────────────────────────────
+    # 1) Stamp the robot's current cell FREE (breadcrumb trail).
+    # 2) Project laser endpoints into the grid as OCCUPIED.
+    robot_x, robot_y, robot_theta = localization.get_pose()
     mapping.mark_visited_from_pose(robot_x, robot_y)
+    if not reset_this_step:
+        laser_ranges, laser_fov, laser_max = sensors.read_laser_scan()
+        if laser_ranges is not None:
+             mapping.update_from_laser(
+                (robot_x, robot_y, robot_theta),
+                laser_ranges, laser_fov, laser_max,
+                LASER_RANGE_REJECT_MARGIN_M,
+            )
 
     # Keyboard edge detection: new_keys fires only on the step a key first appears
     pressed_now = set()
@@ -79,6 +90,7 @@ while devices.robot.step(devices.timestep) != -1:
     if ord('R') in new_keys or ord('r') in new_keys:
         localization.reset_pose()
         mapping.clear()
+        reset_this_step = True
         print("[POSE] reset to (0, 0, 0); map cleared")
 
     if ord('M') in new_keys or ord('m') in new_keys:

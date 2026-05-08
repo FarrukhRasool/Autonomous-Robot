@@ -45,3 +45,5 @@ POSE_LOG_PERIOD_STEPS = 50  # steps between automatic pose log lines
 # ── Mapping ───────────────────────────────────────────────────────────────────
 GRID_RES_M         = 0.10  # m/cell
 GRID_HALF_EXTENT_M = 10.0  # m — grid spans (-half, +half) in both world axes
+
+LASER_RANGE_REJECT_MARGIN_M = 0.05  # m — rays within this of max-range count as no-hit
