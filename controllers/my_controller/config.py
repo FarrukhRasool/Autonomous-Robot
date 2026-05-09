@@ -47,3 +47,12 @@ GRID_RES_M         = 0.10  # m/cell
 GRID_HALF_EXTENT_M = 10.0  # m — grid spans (-half, +half) in both world axes
 
 LASER_RANGE_REJECT_MARGIN_M = 0.05  # m — rays within this of max-range count as no-hit
+MAX_FREE_RAY_LENGTH = 3.0  # m — max length to mark free space along laser rays (beyond this is unknown)
+
+# ── Reactive target seeking ───────────────────────────────────────────────────
+SEEK_LIN_VEL              = 0.20  # m/s   — forward speed when target is centred
+SEEK_OMEGA                = 0.40  # rad/s — yaw rate while orienting toward target
+SEEK_BEARING_DEADBAND_RAD = 0.10  # rad   — |bearing| at or below this counts as centred
+
+# ── Mission ───────────────────────────────────────────────────────────────────
+TARGET_REACHED_DIST_M     = 0.50  # m     — depth-at-centroid below this counts as reached

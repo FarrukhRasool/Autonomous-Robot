@@ -4,15 +4,19 @@ Imports all subsystems and runs the Webots control loop.
 Contains no sensor reads, kinematics, or navigation logic.
 
 Keys: F/S/A/D drive | Space stop | T self-test | G autonomous |
-      I snapshot | L log | O pose | R reset pose & map | M map summary
+      I snapshot | L log | O pose | R reset pose & map | M map summary |
+      P target bearings
 """
+
+import math
 
 import devices                          # hardware init (must import first)
 import sensors
 import motion
 import localization
 import mapping
-from autonomous import autonomous_step, reset_autonomous_state
+import perception
+from autonomous import autonomous_step, reset_autonomous_state, reset_mission_state
 from sensor_debug import format_compact_sensors, format_sensor_snapshot
 from config import (
     TARGET_LIN_VEL, TARGET_ANG_VEL, FRONT_STOP_DIST,
@@ -31,7 +35,8 @@ block_timer      = 0
 print(
     "Controller ready.  Keys: F/S/A/D drive | Space stop | T self-test | "
     "G autonomous mode | I sensor snapshot | L toggle sensor log | "
-    "O pose snapshot | R reset pose & map | M map summary"
+    "O pose snapshot | R reset pose & map | M map summary | "
+    "P target bearings"
 )
 
 
@@ -90,12 +95,39 @@ while devices.robot.step(devices.timestep) != -1:
     if ord('R') in new_keys or ord('r') in new_keys:
         localization.reset_pose()
         mapping.clear()
+        reset_autonomous_state()
+        reset_mission_state()
+        perception.reset_target_memory()
         reset_this_step = True
         print("[POSE] reset to (0, 0, 0); map cleared")
 
     if ord('M') in new_keys or ord('m') in new_keys:
         rx, ry, _ = localization.get_pose()
         print(mapping.summary(robot_xy=(rx, ry)))
+
+    if ord('P') in new_keys or ord('p') in new_keys:
+        _colors = sensors.read_color_detections()
+        _pose   = localization.get_pose()
+
+        def _fmt_target(label, bearing, distance):
+            world = perception.target_world_position(_pose, bearing, distance)
+            b_s = (
+                f"{bearing:+.3f} rad ({math.degrees(bearing):+.1f}°)"
+                if bearing is not None else "None"
+            )
+            d_s = (
+                f"{distance:.3f} m"
+                if (distance is not None and math.isfinite(distance)) else "inf"
+            )
+            w_s = f"({world[0]:+.3f}, {world[1]:+.3f}) m" if world is not None else "None"
+            return f"{label}: bearing={b_s}  distance={d_s}  world={w_s}"
+
+        print("[PERCEPT] " + _fmt_target("blue",
+                                         _colors.get("blue_bearing_rad"),
+                                         _colors.get("blue_distance_m")))
+        print("          " + _fmt_target("yellow",
+                                         _colors.get("yellow_bearing_rad"),
+                                         _colors.get("yellow_distance_m")))
 
     if ord('G') in new_keys or ord('g') in new_keys:
         auto_mode = not auto_mode
@@ -115,7 +147,9 @@ while devices.robot.step(devices.timestep) != -1:
 
     # ── Autonomous or teleop (mutually exclusive) ─────────────────────────────
     elif auto_mode:
-        v_cmd, omega_cmd, sel_label, block_timer, dbg = autonomous_step(block_timer)
+        v_cmd, omega_cmd, sel_label, block_timer, dbg = autonomous_step(
+            block_timer, localization.get_pose()
+        )
 
         if step_count % 10 == 0:
             print(
@@ -123,6 +157,7 @@ while devices.robot.step(devices.timestep) != -1:
                 f"dist={dbg['green_distance']:.3f} "
                 f"blue={dbg['blue']}:{dbg['blue_ratio']:.3f} "
                 f"yellow={dbg['yellow']}:{dbg['yellow_ratio']:.3f} | "
+                f"target={dbg['active_target']} mission={dbg['mission_state']} | "
                 f"overhead={dbg['overhead_front']:.3f} "
                 f"block_timer={dbg['block_timer']} | "
                 f"{sel_label} v={v_cmd:+.2f} omega={omega_cmd:+.2f}"

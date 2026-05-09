@@ -28,7 +28,7 @@ endpoint) is intentionally deferred to a later milestone.
 
 import math
 
-from config import GRID_RES_M, GRID_HALF_EXTENT_M
+from config import GRID_RES_M, GRID_HALF_EXTENT_M, MAX_FREE_RAY_LENGTH
 
 
 UNKNOWN  = 0
@@ -133,8 +133,32 @@ def mark_visited_from_pose(x, y):
     mark_free(ix, iy)
 
 
+def _bresenham(ix0, iy0, ix1, iy1):
+    """Yield integer (ix, iy) cells along the line from start to end, inclusive.
+
+    Standard 2-D Bresenham; handles all 8 octants.
+    """
+    dx =  abs(ix1 - ix0)
+    dy = -abs(iy1 - iy0)
+    sx = 1 if ix0 < ix1 else -1
+    sy = 1 if iy0 < iy1 else -1
+    err = dx + dy
+    x, y = ix0, iy0
+    while True:
+        yield x, y
+        if x == ix1 and y == iy1:
+            return
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x   += sx
+        if e2 <= dx:
+            err += dx
+            y   += sy
+
+
 def update_from_laser(pose, ranges, fov, max_range, reject_margin=0.0):
-    """Project each finite laser hit's endpoint into the grid as OCCUPIED.
+    """Project each laser ray into the grid: FREE along the path, OCCUPIED at hit.
 
     Parameters
     ----------
@@ -147,18 +171,26 @@ def update_from_laser(pose, ranges, fov, max_range, reject_margin=0.0):
     max_range : float
         Sensor maximum range, metres.
     reject_margin : float
-        Rays with r > (max_range - reject_margin) are treated as no-hit
-        and skipped, alongside non-finite and sub-cell readings.
+        Rays with r > (max_range - reject_margin) are treated as no-hit:
+        FREE is marked along the virtual ray to max_range, but no
+        OCCUPIED endpoint is stamped.  Non-finite ranges are also no-hit.
+        Rays with r <= GRID_RES_M are skipped entirely (noise / self-hit).
 
     Body→world transform per ray (frame: body x forward, y left, +theta CCW):
         alpha_i = +fov/2 - i * fov/(n - 1)        body-frame ray angle
-        bx, by  = r * cos(alpha_i), r * sin(alpha_i)
+        bx, by  = r_eff * cos(alpha_i), r_eff * sin(alpha_i)
         wx = px + bx*cos(theta) - by*sin(theta)
         wy = py + bx*sin(theta) + by*cos(theta)
 
-    The laser's mounting offset from robot centre is intentionally ignored:
-    at GRID_RES_M = 0.10 m the worst-case bias is one cell, well below
-    other sources of error (pose, scan jitter).
+    Per-ray cell walk:
+        Bresenham from the robot's grid cell to the endpoint cell.
+        Intermediate cells -> mark_free.
+        Endpoint cell -> mark_occupied (hit) or mark_free (no-hit).
+        mark_free never overrides OCCUPIED, so sticky walls survive
+        re-walks of the same line on subsequent scans.
+
+    The laser's mounting offset from robot centre is ignored: at
+    GRID_RES_M = 0.10 m the worst-case bias is one cell.
     """
     if pose is None or ranges is None or fov is None or max_range is None:
         return
@@ -173,23 +205,67 @@ def update_from_laser(pose, ranges, fov, max_range, reject_margin=0.0):
     half_fov   = 0.5 * fov
     angle_step = fov / (n - 1)
     threshold  = max_range - reject_margin
-    min_range  = GRID_RES_M  # readings below one cell width are noise
+    min_range  = GRID_RES_M
+
+    ix_robot, iy_robot = world_to_grid(px, py)
+
+    # Two-pass scan to prevent NO-HIT rays from leaking FREE past walls.
+    #   Pass 1: HIT rays — stamp every wall this scan sees.
+    #   Pass 2: NO-HIT rays — walk Bresenham, but stop at any OCCUPIED cell.
+    # Without two passes, a NO-HIT ray processed before its corresponding HIT
+    # ray would walk through a not-yet-stamped wall and write FREE past it.
+    hit_endpoints    = []
+    no_hit_endpoints = []
 
     for i, r in enumerate(ranges):
-        if not math.isfinite(r):
+        if r is None or not math.isfinite(r) or r >= threshold:
+            r_eff = min(max_range, MAX_FREE_RAY_LENGTH)
+            is_hit = False
+        elif r <= min_range:
             continue
-        if r <= min_range or r >= threshold:
-            continue
+        else:
+            r_eff  = r
+            is_hit = True
 
         alpha = half_fov - i * angle_step
-        bx = r * math.cos(alpha)
-        by = r * math.sin(alpha)
+        bx = r_eff * math.cos(alpha)
+        by = r_eff * math.sin(alpha)
 
         wx = px + bx * cos_t - by * sin_t
         wy = py + bx * sin_t + by * cos_t
+        ix_end, iy_end = world_to_grid(wx, wy)
 
-        ix, iy = world_to_grid(wx, wy)
-        mark_occupied(ix, iy)
+        if is_hit:
+            hit_endpoints.append((ix_end, iy_end))
+        else:
+            no_hit_endpoints.append((ix_end, iy_end))
+
+    # Pass 1 — HIT rays.  Endpoint is the wall, so Bresenham terminates
+    # exactly there; intermediates FREE, endpoint OCCUPIED.
+    for ix_end, iy_end in hit_endpoints:
+        last_x = last_y = None
+        for cx, cy in _bresenham(ix_robot, iy_robot, ix_end, iy_end):
+            if last_x is not None:
+                mark_free(last_x, last_y)
+            last_x, last_y = cx, cy
+        if last_x is not None:
+            mark_occupied(last_x, last_y)
+
+    # Pass 2 — NO-HIT rays.  Virtual endpoint is at max_range and may be
+    # past actual walls; we stop the walk at the first OCCUPIED cell so
+    # FREE never leaks beyond a wall.
+    for ix_end, iy_end in no_hit_endpoints:
+        last_x = last_y = None
+        blocked = False
+        for cx, cy in _bresenham(ix_robot, iy_robot, ix_end, iy_end):
+            if in_bounds(cx, cy) and _grid[cx][cy] == OCCUPIED:
+                blocked = True
+                break
+            if last_x is not None:
+                mark_free(last_x, last_y)
+            last_x, last_y = cx, cy
+        if last_x is not None and not blocked:
+            mark_free(last_x, last_y)
 
 
 def clear():
