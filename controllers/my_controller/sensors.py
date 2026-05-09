@@ -96,13 +96,13 @@ def _blue_pixel(r, g, b):
 
 def _yellow_pixel(r, g, b):
     return (
-        r > 180 and
-        g > 150 and
-        b < 120 and
-        (r - b > 60) and     # stronger separation
-        (g - b > 50) and
-        abs(r - g) < 40      # ✅ key: yellow has similar R & G
-    )
+            r > 140 and
+            g > 140 and
+            b < 100 and                  # ✅ strong blue suppression
+            abs(r - g) < 25 and          # ✅ VERY tight equality
+            (r + g) > (2 * b + 100)      # ✅ strong dominance
+        )
+
 
 
 

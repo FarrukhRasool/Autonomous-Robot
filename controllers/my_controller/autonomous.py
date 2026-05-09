@@ -259,9 +259,21 @@ def autonomous_step(block_timer, pose=None):
     # its block-recovery logic still runs.  All safety overrides below
     # still apply on top of whichever twist was chosen.
     active_color, active_bearing, active_distance = _active_target_bearing(colors, pose)
-    if active_color is not None and center_min > FRONT_BLOCK_DIST:
+    if active_color is not None:
         sv, somega, slabel = _seek_twist(active_bearing)
-        v_cmd, omega_cmd, label = sv, somega, f"{slabel}_{active_color}"
+        
+    #   ✅ ROTATION → always allowed
+        if sv == 0.0:
+            v_cmd, omega_cmd, label = sv, somega, f"{slabel}_{active_color}"
+            block_timer = 0
+
+        # ✅ FORWARD → only if front is clear
+        elif center_min > FRONT_BLOCK_DIST:
+            v_cmd = sv
+            # ✅ keep wall-follow steering
+            label = f"{slabel}_{active_color}"
+
+
 
     # ── Mission state advancement: check if active target is reached ──────────
     # active_distance is the live depth-at-centroid when the target is
