@@ -59,11 +59,11 @@ def wall_follow_twist(front_min, right_min, left_min,
     """Right-hand wall-following with front caution and open-side turning."""
 
     def _announce(action, v, omega):
-        print(
-            f"[REACTIVE] {action} | "
-            f"front={front_min:.3f} left={left_min:.3f} right={right_min:.3f} | "
-            f"v={v:+.2f} omega={omega:+.2f}"
-        )
+        # print(
+        #     f"[REACTIVE] {action} | "
+        #     f"front={front_min:.3f} left={left_min:.3f} right={right_min:.3f} | "
+        #     f"v={v:+.2f} omega={omega:+.2f}"
+        # )
         return v, omega
 
     # Decide which side is more open
