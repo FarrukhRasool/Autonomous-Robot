@@ -6,8 +6,11 @@ Returns (v_cmd, omega_cmd, label, new_block_timer, debug).
 All sensor reads happen here; no Webots imports elsewhere in this file.
 """
 
+import math
+
 import devices
 import sensors
+import perception
 from reactive import laser_5_sectors, wall_follow_twist
 from config import (
     TARGET_LIN_VEL, TARGET_ANG_VEL,
@@ -17,7 +20,23 @@ from config import (
     OMEGA_SMALL, BLOCK_TIMEOUT, REAR_SAFE_DIST,
     GREEN_STOP_DIST, GREEN_CAUTION_DIST,
     OVERHEAD_DETECT_DIST,
+    SEEK_LIN_VEL, SEEK_OMEGA, SEEK_BEARING_DEADBAND_RAD,
+    TARGET_REACHED_DIST_M,
 )
+
+
+# ── Mission state ────────────────────────────────────────────────────────────
+SEEKING_BLUE   = 0
+SEEKING_YELLOW = 1
+DONE           = 2
+
+_MISSION_NAMES = {
+    SEEKING_BLUE:   "SEEKING_BLUE",
+    SEEKING_YELLOW: "SEEKING_YELLOW",
+    DONE:           "DONE",
+}
+
+_mission_state = SEEKING_BLUE
 
 
 _block_latched = False
@@ -36,6 +55,18 @@ def reset_autonomous_state():
     _block_open_side = None
 
 
+def reset_mission_state():
+    """Reset the mission to SEEKING_BLUE.  Called by the R keypress."""
+    global _mission_state
+    _mission_state = SEEKING_BLUE
+    print("[MISSION] reset to SEEKING_BLUE")
+
+
+def mission_state_name():
+    """Return the current mission state as a human-readable string."""
+    return _MISSION_NAMES.get(_mission_state, "?")
+
+
 def _fuse_front_clearance(laser_front):
     """Fuse laser front range with overhead depth without hiding close laser blocks."""
     _, _, overhead_front = sensors.overhead_depth_regions(OVERHEAD_DETECT_DIST)
@@ -44,13 +75,123 @@ def _fuse_front_clearance(laser_front):
     return laser_front, overhead_front
 
 
-def autonomous_step(block_timer):
+def _active_target_bearing(colors, pose):
+    """Pick the active target governed by the mission state, with memory fallback.
+
+    SEEKING_BLUE   → seek blue (yellow ignored even if visible).
+    SEEKING_YELLOW → seek yellow (blue ignored even if visible).
+    DONE           → no active target.
+
+    When the active color is currently visible:
+        - update perception's persistent memory with the world-frame projection
+        - return the LIVE bearing + distance from the camera
+
+    When the active color is NOT visible but a previous sighting is memorized:
+        - synthesize bearing + distance from the current pose to the stored
+          world position via perception.bearing_distance_from_pose
+
+    Returns (color_name, bearing_rad, distance_m) or (None, None, None).
+    """
+    if _mission_state == SEEKING_BLUE:
+        color = "blue"
+    elif _mission_state == SEEKING_YELLOW:
+        color = "yellow"
+    else:
+        return None, None, None
+
+    visible = (
+        colors.get(color)
+        and colors.get(f"{color}_bearing_rad") is not None
+    )
+    if visible:
+        bearing  = colors[f"{color}_bearing_rad"]
+        distance = colors.get(f"{color}_distance_m", float('inf'))
+        # Update memory with the projected world position (no-op if invalid).
+        perception.update_target_memory(color, pose, bearing, distance)
+        return color, bearing, distance
+
+    mem = perception.get_target_memory(color)
+    if mem is not None:
+        m_bearing, m_distance = perception.bearing_distance_from_pose(pose, mem)
+        if m_bearing is not None:
+            return color, m_bearing, m_distance
+
+    return None, None, None
+
+
+def _is_target_reached(active_color, distance_m, bearing_rad, center_min):
+    """Decide if the active target has been reached.
+
+    Primary signal:
+        depth-at-centroid below TARGET_REACHED_DIST_M.
+
+    Fallback signal (depth saturates near the target):
+        target is centred (|bearing| within seek deadband) AND the front
+        laser is blocked (center_min < FRONT_BLOCK_DIST).  The bearing
+        gate prevents a generic wall in front from triggering reached.
+    """
+    if active_color is None:
+        return False
+    if (distance_m is not None
+            and math.isfinite(distance_m)
+            and distance_m < TARGET_REACHED_DIST_M):
+        return True
+    if (bearing_rad is not None
+            and abs(bearing_rad) < SEEK_BEARING_DEADBAND_RAD
+            and center_min < FRONT_BLOCK_DIST):
+        return True
+    return False
+
+
+def _advance_mission_state(reached_color, distance_m):
+    """Transition the mission state when the active target is reached."""
+    global _mission_state
+    new_state = _mission_state
+    if _mission_state == SEEKING_BLUE and reached_color == "blue":
+        new_state = SEEKING_YELLOW
+    elif _mission_state == SEEKING_YELLOW and reached_color == "yellow":
+        new_state = DONE
+    if new_state != _mission_state:
+        d_str = (
+            f"{distance_m:.2f}"
+            if (distance_m is not None and math.isfinite(distance_m))
+            else "inf"
+        )
+        print(
+            f"[MISSION] {_MISSION_NAMES[_mission_state]} → "
+            f"{_MISSION_NAMES[new_state]} ({reached_color} reached, distance={d_str})"
+        )
+        _mission_state = new_state
+
+
+def _seek_twist(bearing_rad):
+    """Body twist that orients toward the target then drives forward.
+
+    Bearing convention (matches sensors._pixel_to_bearing):
+        bearing > 0 → target on robot's left  → omega > 0 (rotate left)
+        bearing < 0 → target on robot's right → omega < 0 (rotate right)
+    Inside the deadband, drive forward at SEEK_LIN_VEL with omega = 0.
+    """
+    if abs(bearing_rad) > SEEK_BEARING_DEADBAND_RAD:
+        if bearing_rad > 0:
+            return 0.0, +SEEK_OMEGA, "seek_turn_left"
+        return 0.0, -SEEK_OMEGA, "seek_turn_right"
+    return SEEK_LIN_VEL, 0.0, "seek_forward"
+
+
+def autonomous_step(block_timer, pose=None):
     """Run one step of autonomous right-hand wall-following.
 
     Parameters
     ----------
     block_timer : int
         Consecutive steps the front has been blocked (carried across calls).
+    pose : (x_m, y_m, theta_rad), optional
+        Current robot pose in the (reset-anchored) world frame.  When
+        provided, target sightings are memorised and re-acquisition uses
+        memory when the target leaves the field of view.  When None,
+        memory is neither read nor written and seek behavior degrades to
+        live-only (M4.0c equivalent).
 
     Returns
     -------
@@ -112,6 +253,36 @@ def autonomous_step(block_timer):
         open_side_hint=_block_open_side,
     )
 
+    # ── Reactive target seek (FR5: blue first, then yellow) ──────────────────
+    # Substitute the seek twist for the wall-follow output only when the
+    # front is clear; otherwise let wall-follow handle the obstruction so
+    # its block-recovery logic still runs.  All safety overrides below
+    # still apply on top of whichever twist was chosen.
+    active_color, active_bearing, active_distance = _active_target_bearing(colors, pose)
+    if active_color is not None:
+        sv, somega, slabel = _seek_twist(active_bearing)
+        
+    #   ✅ ROTATION → always allowed
+        if sv == 0.0:
+            v_cmd, omega_cmd, label = sv, somega, f"{slabel}_{active_color}"
+            block_timer = 0
+
+        # ✅ FORWARD → only if front is clear
+        elif center_min > FRONT_BLOCK_DIST:
+            v_cmd = sv
+            # ✅ keep wall-follow steering
+            label = f"{slabel}_{active_color}"
+
+
+
+    # ── Mission state advancement: check if active target is reached ──────────
+    # active_distance is the live depth-at-centroid when the target is
+    # visible, or the synthesised pose-to-memory distance when it isn't.
+    # The reached predicate also falls back to "centred AND front blocked"
+    # when depth is unmeasurable.
+    if _is_target_reached(active_color, active_distance, active_bearing, center_min):
+        _advance_mission_state(active_color, active_distance)
+
     # ── Hard emergency overrides (applied after wall-follow decision) ──────────
     laser_front_emg = center_min < FRONT_STOP_DIST
     fl_emg    = fl_val < FRONT_STOP_DIST
@@ -154,15 +325,23 @@ def autonomous_step(block_timer):
             omega_cmd = open_sign * TARGET_ANG_VEL
             label     = "green_ground_unknown_turn_left" if open_sign > 0 else "green_ground_unknown_turn_right"
 
+    # ── DONE: mission complete, hold still regardless of any other signal ────
+    if _mission_state == DONE:
+        v_cmd     = 0.0
+        omega_cmd = 0.0
+        label     = "mission_done"
+
     debug = {
-        "green":         colors["green"],
-        "green_ratio":   colors["green_ratio"],
+        "green":          colors["green"],
+        "green_ratio":    colors["green_ratio"],
         "green_distance": colors["green_distance"],
-        "blue":          colors["blue"],
-        "blue_ratio":    colors["blue_ratio"],
-        "yellow":        colors["yellow"],
-        "yellow_ratio":  colors["yellow_ratio"],
+        "blue":           colors["blue"],
+        "blue_ratio":     colors["blue_ratio"],
+        "yellow":         colors["yellow"],
+        "yellow_ratio":   colors["yellow_ratio"],
         "overhead_front": overhead_min,
-        "block_timer":   block_timer,
+        "block_timer":    block_timer,
+        "active_target":  active_color,
+        "mission_state":  _MISSION_NAMES[_mission_state],
     }
     return v_cmd, omega_cmd, label, block_timer, debug

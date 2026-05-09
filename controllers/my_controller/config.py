@@ -38,3 +38,21 @@ TARGET_PIXEL_RATIO = 0.03  # center ROI fraction that means pillar visible
 GREEN_DEPTH_MIN_VALID = 0.03  # m — reject only zero/near-zero green depth pixels
 GREEN_STOP_DIST    = 0.35  # m — green is too close; stop and turn away
 GREEN_CAUTION_DIST = 0.75  # m — green ahead; slow down and steer away
+
+# ── Localization ──────────────────────────────────────────────────────────────
+POSE_LOG_PERIOD_STEPS = 50  # steps between automatic pose log lines
+
+# ── Mapping ───────────────────────────────────────────────────────────────────
+GRID_RES_M         = 0.10  # m/cell
+GRID_HALF_EXTENT_M = 10.0  # m — grid spans (-half, +half) in both world axes
+
+LASER_RANGE_REJECT_MARGIN_M = 0.05  # m — rays within this of max-range count as no-hit
+MAX_FREE_RAY_LENGTH = 3.0  # m — max length to mark free space along laser rays (beyond this is unknown)
+
+# ── Reactive target seeking ───────────────────────────────────────────────────
+SEEK_LIN_VEL              = 0.20  # m/s   — forward speed when target is centred
+SEEK_OMEGA                = 0.40  # rad/s — yaw rate while orienting toward target
+SEEK_BEARING_DEADBAND_RAD = 0.10  # rad   — |bearing| at or below this counts as centred
+
+# ── Mission ───────────────────────────────────────────────────────────────────
+TARGET_REACHED_DIST_M     = 0.50  # m     — depth-at-centroid below this counts as reached
