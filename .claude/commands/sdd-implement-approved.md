@@ -2,7 +2,7 @@ Implement only the currently approved milestone.
 
 Rules:
 1. Read CLAUDE.md.
-2. Read docs/specs/001-rosbot-navigation.md.
+2. Read .claude/specs/001-rosbot-navigation.md
 3. Do not implement future milestones.
 4. Do not use Webots Supervisor.
 5. Do not modify robot or environment files.

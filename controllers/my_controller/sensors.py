@@ -87,11 +87,24 @@ def _green_pixel(r, g, b):
 
 
 def _blue_pixel(r, g, b):
-    return b > 90 and b > 1.35 * r and b > 1.25 * g
+    return (
+        b > 60 and            # ✅ lower threshold
+        b > 1.2 * r and      # blue dominates red
+        b > 1.2 * g          # blue dominates green
+    )
 
 
 def _yellow_pixel(r, g, b):
-    return r > 110 and g > 95 and b < 0.75 * min(r, g)
+    return (
+            r > 140 and
+            g > 140 and
+            b < 100 and                  # ✅ strong blue suppression
+            abs(r - g) < 25 and          # ✅ VERY tight equality
+            (r + g) > (2 * b + 100)      # ✅ strong dominance
+        )
+
+
+
 
 
 def _green_ground_roi(w, h):
@@ -107,9 +120,11 @@ def _target_roi(w, h):
 def _sample_color_ratio(img, w, h, roi, predicate,
                         depth_data=None, depth_w=0, depth_h=0):
     col0, col1, row0, row1 = roi
-    total = 0
-    hits = 0
-    depths = []
+    total   = 0
+    hits    = 0
+    col_sum = 0
+    row_sum = 0
+    depths  = []
 
     for row in range(row0, row1, 3):
         for col in range(col0, col1, 3):
@@ -119,12 +134,42 @@ def _sample_color_ratio(img, w, h, roi, predicate,
                 continue
 
             hits += 1
+            col_sum += col
+            row_sum += row
             depth = _depth_at_rgb_pixel(depth_data, depth_w, depth_h, w, h, row, col)
             if depth is not None:
                 depths.append(depth)
 
-    ratio = hits / total if total else 0.0
-    return ratio, depths
+    ratio    = hits / total if total else 0.0
+    centroid = (col_sum / hits, row_sum / hits) if hits else None
+    return ratio, depths, centroid
+
+
+def _pixel_to_bearing(col, w, fov):
+    """Convert image column to body-frame bearing in radians.
+
+    Sign convention (matches reactive.py laser sectors):
+        col = 0       → +fov/2  (target on robot's left, +y body)
+        col = w - 1   → -fov/2  (target on robot's right, -y body)
+    Returns None for degenerate inputs.
+    """
+    if w is None or w <= 1 or fov is None:
+        return None
+    return 0.5 * fov * (1.0 - 2.0 * col / (w - 1))
+
+
+def _read_rgb_fov():
+    if devices.camera_rgb is None:
+        return None
+    try:
+        fov = devices.camera_rgb.getFov()
+    except Exception:
+        return None
+    return fov if fov is not None and math.isfinite(fov) else None
+
+
+# Cached at import time — RGB camera FOV does not change at runtime.
+_rgb_fov = _read_rgb_fov()
 
 
 def _read_scalar(sensor):
@@ -134,6 +179,57 @@ def _read_scalar(sensor):
         return sensor.getValue()
     except Exception:
         return None
+
+
+def read_wheel_angles():
+    """Return (left_rad, right_rad) — averaged cumulative wheel angles.
+
+    Front and rear wheels on the same side share a motor command, so their
+    encoders should agree closely; the average is robust to small jitter.
+    Returns (None, None) if any encoder is unavailable.
+    """
+    fl = _read_scalar(devices.fl_wheel_sensor)
+    fr = _read_scalar(devices.fr_wheel_sensor)
+    rl = _read_scalar(devices.rl_wheel_sensor)
+    rr = _read_scalar(devices.rr_wheel_sensor)
+    if fl is None or fr is None or rl is None or rr is None:
+        return None, None
+    return 0.5 * (fl + rl), 0.5 * (fr + rr)
+
+
+def read_imu_yaw():
+    """Return the inertial-unit yaw in radians, or None if unavailable.
+
+    Webots' InertialUnit returns absolute world-frame roll/pitch/yaw; we
+    take element [2].  No baseline subtraction here — that belongs to the
+    pose layer, which captures a baseline on reset.
+    """
+    rpy = _read_vector(devices.inertial_unit, "getRollPitchYaw")
+    if rpy is None:
+        return None
+    yaw = rpy[2]
+    return yaw if math.isfinite(yaw) else None
+
+
+def read_laser_scan():
+    """Return (ranges, fov_rad, max_range_m) for the laser, or (None, None, None).
+
+    `ranges` is the raw range image (index 0 = leftmost ray, matching
+    reactive.py's sector convention).  Caller is responsible for
+    rejecting inf, near-zero, and near-max-range readings.
+    """
+    laser = devices.laser
+    if laser is None:
+        return None, None, None
+    try:
+        ranges = laser.getRangeImage()
+        fov = laser.getFov()
+        max_range = laser.getMaxRange()
+    except Exception:
+        return None, None, None
+    if not ranges or fov is None or max_range is None:
+        return None, None, None
+    return ranges, fov, max_range
 
 
 def _read_vector(sensor, method):
@@ -296,9 +392,11 @@ def read_color_detections():
     correspond to green RGB pixels.
     """
     result = {
-        "green": False, "green_ratio": 0.0, "green_distance": INF,
-        "blue": False, "blue_ratio": 0.0,
+        "green":  False, "green_ratio":  0.0, "green_distance": INF,
+        "blue":   False, "blue_ratio":   0.0,
+        "blue_bearing_rad":   None, "blue_distance_m":   INF,
         "yellow": False, "yellow_ratio": 0.0,
+        "yellow_bearing_rad": None, "yellow_distance_m": INF,
     }
 
     img, w, h = _read_camera_image(devices.camera_rgb)
@@ -306,23 +404,60 @@ def read_color_detections():
         return result
 
     depth_data, depth_w, depth_h = _read_depth_image()
-    green_ratio, green_depths = _sample_color_ratio(
-        img, w, h, _green_ground_roi(w, h), _green_pixel,
-        depth_data, depth_w, depth_h,
-    )
-    blue_ratio, _ = _sample_color_ratio(img, w, h, _target_roi(w, h), _blue_pixel)
-    yellow_ratio, _ = _sample_color_ratio(img, w, h, _target_roi(w, h), _yellow_pixel)
 
-    result["green_ratio"] = green_ratio
-    result["blue_ratio"] = blue_ratio
+    # ✅ Keep depths from sampling
+    green_ratio, green_depths, _ = _sample_color_ratio(
+        img, w, h,
+        _green_ground_roi(w, h), _green_pixel,
+        depth_data, depth_w, depth_h
+    )
+
+    blue_ratio, blue_depths, blue_centroid = _sample_color_ratio(
+        img, w, h,
+        _target_roi(w, h), _blue_pixel,
+        depth_data, depth_w, depth_h
+    )
+
+    yellow_ratio, yellow_depths, yellow_centroid = _sample_color_ratio(
+        img, w, h,
+        _target_roi(w, h), _yellow_pixel,
+        depth_data, depth_w, depth_h
+    )
+
+    # ✅ Store ratios
+    result["green_ratio"]  = green_ratio
+    result["blue_ratio"]   = blue_ratio
     result["yellow_ratio"] = yellow_ratio
 
+    # ✅ Green distance (already correct)
     if green_depths:
         result["green_distance"] = _percentile(green_depths, 10)
 
-    result["green"] = green_ratio >= GREEN_PIXEL_RATIO
-    result["blue"] = blue_ratio >= TARGET_PIXEL_RATIO
+    # ✅ Detection flags
+    result["green"]  = green_ratio  >= GREEN_PIXEL_RATIO
+    result["blue"]   = blue_ratio   >= TARGET_PIXEL_RATIO
     result["yellow"] = yellow_ratio >= TARGET_PIXEL_RATIO
+
+    # ✅ BLUE processing (FINAL CORRECT)
+    if result["blue"] and blue_centroid is not None:
+        bcol, brow = int(blue_centroid[0]), int(blue_centroid[1])
+
+        result["blue_bearing_rad"] = _pixel_to_bearing(bcol, w, _rgb_fov)
+
+        # ✅ Use robust region-based depth
+        if blue_depths:
+            result["blue_distance_m"] = min(blue_depths)
+
+    # ✅ YELLOW processing (FINAL CORRECT)
+    if result["yellow"] and yellow_centroid is not None:
+        ycol, yrow = int(yellow_centroid[0]), int(yellow_centroid[1])
+
+        result["yellow_bearing_rad"] = _pixel_to_bearing(ycol, w, _rgb_fov)
+
+        # ✅ Use robust region-based depth
+        if yellow_depths:
+            result["yellow_distance_m"] = min(yellow_depths)
+
     return result
 
 
