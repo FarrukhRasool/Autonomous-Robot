@@ -49,6 +49,16 @@ GRID_HALF_EXTENT_M = 10.0  # m — grid spans (-half, +half) in both world axes
 LASER_RANGE_REJECT_MARGIN_M = 0.05  # m — rays within this of max-range count as no-hit
 MAX_FREE_RAY_LENGTH = 3.0  # m — max length to mark free space along laser rays (beyond this is unknown)
 
+# Probabilistic occupancy update
+LASER_MIN_VALID_RANGE_M = 0.25  # m — skip hits closer than this (robot chassis clearance)
+MAP_OCC_HIT_THRESHOLD   = 2     # laser hits required before a cell becomes OCCUPIED
+MAP_FREE_VOTE_CLEAR     = 6     # free-ray passes required to revert an OCCUPIED cell to UNKNOWN
+
+# Scan integration quality
+LASER_RAY_STRIDE     = 2     # process every Nth laser ray (1 = all rays)
+MAP_MIN_SCAN_TRANS_M = 0.05  # m   — min robot translation before integrating a new scan
+MAP_MIN_SCAN_ROT_RAD = 0.05  # rad — min robot rotation before integrating a new scan
+
 # ── Reactive target seeking ───────────────────────────────────────────────────
 SEEK_LIN_VEL              = 0.20  # m/s   — forward speed when target is centred
 SEEK_OMEGA                = 0.40  # rad/s — yaw rate while orienting toward target
@@ -56,3 +66,19 @@ SEEK_BEARING_DEADBAND_RAD = 0.10  # rad   — |bearing| at or below this counts 
 
 # ── Mission ───────────────────────────────────────────────────────────────────
 TARGET_REACHED_DIST_M     = 0.50  # m     — depth-at-centroid below this counts as reached
+
+# ── Planner ───────────────────────────────────────────────────────────────────
+PLANNER_INFLATE_CELLS     = 3     # cells — safety inflation around OCCUPIED cells
+
+# ── Waypoint controller ───────────────────────────────────────────────────────
+WP_ACCEPT_DIST_M          = 0.25  # m     — advance to next waypoint within this radius
+WP_BEARING_DEADBAND_RAD   = 0.15  # rad   — rotate-only zone; drive forward inside
+WP_LIN_VEL                = 0.25  # m/s   — forward speed while path-following
+WP_ANG_VEL                = 0.45  # rad/s — rotation speed while aligning to waypoint
+
+# ── Navigation mode ───────────────────────────────────────────────────────────
+REPLAN_BLOCK_TIMEOUT      = 80    # steps — replan when stuck this long in FOLLOW mode
+REPLAN_PERIOD_STEPS       = 300   # steps — periodic replan interval (path accuracy)
+
+# ── Visualizer ────────────────────────────────────────────────────────────────
+VIZ_SAVE_PERIOD_STEPS     = 0     # steps — auto-save map every N steps (0 = off)

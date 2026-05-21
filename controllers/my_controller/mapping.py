@@ -3,32 +3,39 @@
 Pure Python — no Webots imports.  Defines a 2-D world-frame grid plus
 coordinate-conversion helpers and two write paths:
     - mark_visited_from_pose(x, y)   stamps the robot's cell as FREE
-    - update_from_laser(pose, ...)   stamps each laser hit's cell as OCCUPIED
+    - update_from_laser(pose, ...)   updates cells using probabilistic votes
+
+Probabilistic update model
+--------------------------
+Each cell stores a hit_count (laser-endpoint hits) and a miss_count
+(free-ray passes-through).  The derived state is:
+
+    OCCUPIED  : hit_count >= MAP_OCC_HIT_THRESHOLD
+    FREE      : any observation but hit_count < threshold
+    UNKNOWN   : never observed (both counts == 0)
+
+A cell reverts from OCCUPIED to UNKNOWN when
+    miss_count >= MAP_FREE_VOTE_CLEAR * hit_count,
+so noise / sensor-body reflections self-correct as the robot moves and
+later rays consistently pass through an incorrectly-occupied cell.
+
+Minimum laser range filtering (LASER_MIN_VALID_RANGE_M) prevents the
+robot's own chassis from being mapped as a wall.
 
 Frame convention (matches localization.py):
-    World x forward, y left.  The world origin (0, 0) — the location of
-    the robot at reset_pose() — maps to the grid centre.
-
-Cell layout:
-    n_cells     = round(2 * GRID_HALF_EXTENT_M / GRID_RES_M)   square grid
-    half_cells  = n_cells // 2
-    ix          = round(x / res) + half_cells
-    iy          = round(y / res) + half_cells
-    Cell (half_cells, half_cells) is the world origin.
-    grid_to_world() returns the cell *centre* in world metres.
-
-State precedence:
-    OCCUPIED beats FREE — a laser hit overrides a previous breadcrumb.
-    FREE never overrides OCCUPIED — walls are sticky.
-    Both override UNKNOWN.
-
-Free-space ray-casting (FREE along the entire ray, not just at the
-endpoint) is intentionally deferred to a later milestone.
+    World x forward, y left.  World origin (0, 0) at reset_pose().
+    Cell (half_cells, half_cells) maps to the origin.
+    grid_to_world() returns each cell's *centre* in world metres.
 """
 
 import math
 
-from config import GRID_RES_M, GRID_HALF_EXTENT_M, MAX_FREE_RAY_LENGTH
+from config import (
+    GRID_RES_M, GRID_HALF_EXTENT_M, MAX_FREE_RAY_LENGTH,
+    LASER_MIN_VALID_RANGE_M,
+    MAP_OCC_HIT_THRESHOLD, MAP_FREE_VOTE_CLEAR,
+    LASER_RAY_STRIDE, MAP_MIN_SCAN_TRANS_M, MAP_MIN_SCAN_ROT_RAD,
+)
 
 
 UNKNOWN  = 0
@@ -39,19 +46,25 @@ OCCUPIED = 2
 _n_cells    = int(round(2.0 * GRID_HALF_EXTENT_M / GRID_RES_M))
 _half_cells = _n_cells // 2
 
+# Derived state (UNKNOWN/FREE/OCCUPIED) — kept in sync with vote counts.
 _grid = [bytearray(_n_cells) for _ in range(_n_cells)]
+
+# Vote accumulators — capped at 127 to fit a signed byte.
+_hit_count  = [bytearray(_n_cells) for _ in range(_n_cells)]
+_miss_count = [bytearray(_n_cells) for _ in range(_n_cells)]
 
 _free_count     = 0
 _occupied_count = 0
 
-# Bounding boxes of cells in world metres, [xmin, xmax, ymin, ymax].
-# Stored as a list so we can mutate in place without `global` declarations.
-# Entries are None when no cell of that state has been marked.
+# Bounding boxes [xmin, xmax, ymin, ymax]; None when no cell of that state.
 _free_bbox     = [None, None, None, None]
 _occupied_bbox = [None, None, None, None]
 
+# Pose at which the last scan was integrated; None after clear().
+_last_scan_pose = None
 
-# ── Geometry helpers ─────────────────────────────────────────────────────────
+
+# ── Geometry helpers ──────────────────────────────────────────────────────────
 
 def grid_size():
     """Return (n_cells_x, n_cells_y, half_cells)."""
@@ -76,10 +89,19 @@ def in_bounds(ix, iy):
     return 0 <= ix < _n_cells and 0 <= iy < _n_cells
 
 
-# ── State writers ────────────────────────────────────────────────────────────
+def get_cell(ix, iy):
+    """Return UNKNOWN/FREE/OCCUPIED for cell (ix, iy).
+
+    Out-of-bounds indices return UNKNOWN; callers need no bounds check.
+    """
+    if not in_bounds(ix, iy):
+        return UNKNOWN
+    return _grid[ix][iy]
+
+
+# ── Internal state updater ────────────────────────────────────────────────────
 
 def _expand_bbox(bbox, x, y):
-    """In-place expansion of [xmin, xmax, ymin, ymax] to include (x, y)."""
     if bbox[0] is None:
         bbox[0] = bbox[1] = x
         bbox[2] = bbox[3] = y
@@ -90,54 +112,109 @@ def _expand_bbox(bbox, x, y):
     if y > bbox[3]: bbox[3] = y
 
 
-def mark_free(ix, iy):
-    """Mark cell (ix, iy) as FREE if currently UNKNOWN.
+def _sync_state(ix, iy):
+    """Recompute _grid[ix][iy] from vote counts and update stats."""
+    global _free_count, _occupied_count
 
-    Out-of-bounds calls are silently ignored.  FREE is idempotent.
-    OCCUPIED cells are *not* downgraded — walls are sticky.
-    """
-    global _free_count
+    h = _hit_count[ix][iy]
+    m = _miss_count[ix][iy]
+
+    # Determine new state from votes.
+    if h >= MAP_OCC_HIT_THRESHOLD:
+        # Revert to UNKNOWN if free votes dominate (self-correcting noise).
+        if m >= MAP_FREE_VOTE_CLEAR * h:
+            new_state = UNKNOWN
+        else:
+            new_state = OCCUPIED
+    elif h > 0 or m > 0:
+        new_state = FREE
+    else:
+        new_state = UNKNOWN
+
+    old_state = _grid[ix][iy]
+    if old_state == new_state:
+        return
+
+    # Update counters.
+    if old_state == FREE:
+        _free_count -= 1
+    elif old_state == OCCUPIED:
+        _occupied_count -= 1
+
+    _grid[ix][iy] = new_state
+    wx, wy = grid_to_world(ix, iy)
+
+    if new_state == FREE:
+        _free_count += 1
+        _expand_bbox(_free_bbox, wx, wy)
+    elif new_state == OCCUPIED:
+        _occupied_count += 1
+        _expand_bbox(_occupied_bbox, wx, wy)
+
+
+# ── Vote writers (internal) ───────────────────────────────────────────────────
+
+def _vote_hit(ix, iy):
+    """Register one laser-endpoint hit at cell (ix, iy)."""
     if not in_bounds(ix, iy):
         return
-    if _grid[ix][iy] != UNKNOWN:
+    if _hit_count[ix][iy] < 127:
+        _hit_count[ix][iy] += 1
+    _sync_state(ix, iy)
+
+
+def _vote_free(ix, iy):
+    """Register one free-ray pass-through at cell (ix, iy).
+
+    Increments miss_count.  Also decrements hit_count so that noise hits
+    self-correct when the robot later scans through the same cell cleanly.
+    """
+    if not in_bounds(ix, iy):
         return
-    _grid[ix][iy] = FREE
-    _free_count += 1
-    wx, wy = grid_to_world(ix, iy)
-    _expand_bbox(_free_bbox, wx, wy)
+    if _miss_count[ix][iy] < 127:
+        _miss_count[ix][iy] += 1
+    if _hit_count[ix][iy] > 0:
+        _hit_count[ix][iy] -= 1
+    _sync_state(ix, iy)
+
+
+# ── Public state writers ──────────────────────────────────────────────────────
+
+def mark_free(ix, iy):
+    """Mark cell (ix, iy) as FREE (one miss vote).
+
+    Out-of-bounds calls are silently ignored.
+    """
+    _vote_free(ix, iy)
 
 
 def mark_occupied(ix, iy):
-    """Mark cell (ix, iy) as OCCUPIED.
+    """Mark cell (ix, iy) as OCCUPIED (one hit vote).
 
-    Out-of-bounds calls are silently ignored.  OCCUPIED is idempotent and
-    overrides FREE (laser hit beats breadcrumb).
+    The cell becomes OCCUPIED only after MAP_OCC_HIT_THRESHOLD votes.
+    Out-of-bounds calls are silently ignored.
     """
-    global _free_count, _occupied_count
-    if not in_bounds(ix, iy):
-        return
-    state = _grid[ix][iy]
-    if state == OCCUPIED:
-        return
-    if state == FREE:
-        _free_count -= 1
-    _grid[ix][iy] = OCCUPIED
-    _occupied_count += 1
-    wx, wy = grid_to_world(ix, iy)
-    _expand_bbox(_occupied_bbox, wx, wy)
+    _vote_hit(ix, iy)
 
 
 def mark_visited_from_pose(x, y):
-    """Mark the cell containing world position (x, y) as FREE."""
-    ix, iy = world_to_grid(x, y)
-    mark_free(ix, iy)
+    """Mark the robot's cell and immediate neighbours as FREE.
 
+    Casts two free votes per cell so the robot's known-free footprint
+    overcomes occasional noise hits near the robot's path.
+    """
+    ix, iy = world_to_grid(x, y)
+    for dx, dy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
+        nx, ny = ix + dx, iy + dy
+        if in_bounds(nx, ny):
+            _vote_free(nx, ny)
+            _vote_free(nx, ny)   # double vote: beats a single noise hit
+
+
+# ── Bresenham line rasteriser ─────────────────────────────────────────────────
 
 def _bresenham(ix0, iy0, ix1, iy1):
-    """Yield integer (ix, iy) cells along the line from start to end, inclusive.
-
-    Standard 2-D Bresenham; handles all 8 octants.
-    """
+    """Yield integer (ix, iy) cells along the line from start to end, inclusive."""
     dx =  abs(ix1 - ix0)
     dy = -abs(iy1 - iy0)
     sx = 1 if ix0 < ix1 else -1
@@ -157,8 +234,10 @@ def _bresenham(ix0, iy0, ix1, iy1):
             y   += sy
 
 
+# ── Laser update ──────────────────────────────────────────────────────────────
+
 def update_from_laser(pose, ranges, fov, max_range, reject_margin=0.0):
-    """Project each laser ray into the grid: FREE along the path, OCCUPIED at hit.
+    """Update the grid from one laser scan using probabilistic voting.
 
     Parameters
     ----------
@@ -171,32 +250,57 @@ def update_from_laser(pose, ranges, fov, max_range, reject_margin=0.0):
     max_range : float
         Sensor maximum range, metres.
     reject_margin : float
-        Rays with r > (max_range - reject_margin) are treated as no-hit:
-        FREE is marked along the virtual ray to max_range, but no
-        OCCUPIED endpoint is stamped.  Non-finite ranges are also no-hit.
-        Rays with r <= GRID_RES_M are skipped entirely (noise / self-hit).
+        Rays with r > (max_range - reject_margin) are no-hit: free votes
+        are cast along the ray up to MAX_FREE_RAY_LENGTH.
 
-    Body→world transform per ray (frame: body x forward, y left, +theta CCW):
-        alpha_i = +fov/2 - i * fov/(n - 1)        body-frame ray angle
-        bx, by  = r_eff * cos(alpha_i), r_eff * sin(alpha_i)
+    Filtering
+    ---------
+    Rays with r < LASER_MIN_VALID_RANGE_M are skipped entirely — these
+    hit the robot's own chassis and would create false occupied cells.
+
+    Motion gate
+    -----------
+    Skips integration when the robot has not moved at least MAP_MIN_SCAN_TRANS_M
+    or rotated at least MAP_MIN_SCAN_ROT_RAD since the last integrated scan.
+    This prevents noise accumulation while the robot is stationary.
+
+    Ray stride
+    ----------
+    Only every LASER_RAY_STRIDE-th ray is processed.  The angular spacing
+    between processed rays is still fine enough for wall detection.
+
+    Two-pass scan
+    -------------
+    Pass 1: HIT rays — cast one hit vote at the endpoint; cast free votes
+            along the Bresenham path from robot to wall.
+    Pass 2: NO-HIT rays — cast free votes along the ray, stopping at any
+            OCCUPIED cell to avoid leaking FREE past confirmed walls.
+
+    Body→world transform per ray (body x forward, y left, +theta CCW):
+        alpha_i = +fov/2 - i * fov/(n - 1)
+        bx = r * cos(alpha_i),  by = r * sin(alpha_i)
         wx = px + bx*cos(theta) - by*sin(theta)
         wy = py + bx*sin(theta) + by*cos(theta)
-
-    Per-ray cell walk:
-        Bresenham from the robot's grid cell to the endpoint cell.
-        Intermediate cells -> mark_free.
-        Endpoint cell -> mark_occupied (hit) or mark_free (no-hit).
-        mark_free never overrides OCCUPIED, so sticky walls survive
-        re-walks of the same line on subsequent scans.
-
-    The laser's mounting offset from robot centre is ignored: at
-    GRID_RES_M = 0.10 m the worst-case bias is one cell.
     """
+    global _last_scan_pose
+
     if pose is None or ranges is None or fov is None or max_range is None:
         return
     n = len(ranges)
     if n < 2:
         return
+
+    # Motion gate: skip if robot hasn't moved enough since last integration.
+    if _last_scan_pose is not None:
+        lx, ly, lt = _last_scan_pose
+        px, py, ptheta = pose
+        trans = math.hypot(px - lx, py - ly)
+        drot  = abs(ptheta - lt)
+        if drot > math.pi:
+            drot = 2.0 * math.pi - drot
+        if trans < MAP_MIN_SCAN_TRANS_M and drot < MAP_MIN_SCAN_ROT_RAD:
+            return
+    _last_scan_pose = pose
 
     px, py, ptheta = pose
     cos_t = math.cos(ptheta)
@@ -205,24 +309,20 @@ def update_from_laser(pose, ranges, fov, max_range, reject_margin=0.0):
     half_fov   = 0.5 * fov
     angle_step = fov / (n - 1)
     threshold  = max_range - reject_margin
-    min_range  = GRID_RES_M
+    min_r      = LASER_MIN_VALID_RANGE_M          # ← skip robot-body hits
 
     ix_robot, iy_robot = world_to_grid(px, py)
 
-    # Two-pass scan to prevent NO-HIT rays from leaking FREE past walls.
-    #   Pass 1: HIT rays — stamp every wall this scan sees.
-    #   Pass 2: NO-HIT rays — walk Bresenham, but stop at any OCCUPIED cell.
-    # Without two passes, a NO-HIT ray processed before its corresponding HIT
-    # ray would walk through a not-yet-stamped wall and write FREE past it.
     hit_endpoints    = []
     no_hit_endpoints = []
 
-    for i, r in enumerate(ranges):
+    for i in range(0, n, LASER_RAY_STRIDE):
+        r = ranges[i]
         if r is None or not math.isfinite(r) or r >= threshold:
-            r_eff = min(max_range, MAX_FREE_RAY_LENGTH)
+            r_eff  = min(max_range, MAX_FREE_RAY_LENGTH)
             is_hit = False
-        elif r <= min_range:
-            continue
+        elif r < min_r:
+            continue          # skip — almost certainly robot chassis
         else:
             r_eff  = r
             is_hit = True
@@ -240,45 +340,51 @@ def update_from_laser(pose, ranges, fov, max_range, reject_margin=0.0):
         else:
             no_hit_endpoints.append((ix_end, iy_end))
 
-    # Pass 1 — HIT rays.  Endpoint is the wall, so Bresenham terminates
-    # exactly there; intermediates FREE, endpoint OCCUPIED.
+    # Pass 1 — HIT rays: free votes along path, hit vote at endpoint.
     for ix_end, iy_end in hit_endpoints:
         last_x = last_y = None
         for cx, cy in _bresenham(ix_robot, iy_robot, ix_end, iy_end):
             if last_x is not None:
-                mark_free(last_x, last_y)
+                _vote_free(last_x, last_y)
             last_x, last_y = cx, cy
         if last_x is not None:
-            mark_occupied(last_x, last_y)
+            _vote_hit(last_x, last_y)
 
-    # Pass 2 — NO-HIT rays.  Virtual endpoint is at max_range and may be
-    # past actual walls; we stop the walk at the first OCCUPIED cell so
-    # FREE never leaks beyond a wall.
+    # Pass 2 — NO-HIT rays: free votes along path, stop early.
+    # Stop at any cell with hit_count > 0, not just fully-OCCUPIED cells.
+    # This prevents free-space from leaking through wall cells that have
+    # accumulated one hit vote but haven't yet reached the OCCUPIED threshold.
     for ix_end, iy_end in no_hit_endpoints:
         last_x = last_y = None
         blocked = False
         for cx, cy in _bresenham(ix_robot, iy_robot, ix_end, iy_end):
-            if in_bounds(cx, cy) and _grid[cx][cy] == OCCUPIED:
+            if in_bounds(cx, cy) and (_grid[cx][cy] == OCCUPIED
+                                      or _hit_count[cx][cy] > 0):
                 blocked = True
                 break
             if last_x is not None:
-                mark_free(last_x, last_y)
+                _vote_free(last_x, last_y)
             last_x, last_y = cx, cy
         if last_x is not None and not blocked:
-            mark_free(last_x, last_y)
+            _vote_free(last_x, last_y)
 
+
+# ── Grid reset ────────────────────────────────────────────────────────────────
 
 def clear():
     """Wipe the grid back to UNKNOWN and reset all stats."""
-    global _grid, _free_count, _occupied_count
-    _grid = [bytearray(_n_cells) for _ in range(_n_cells)]
+    global _grid, _hit_count, _miss_count, _free_count, _occupied_count, _last_scan_pose
+    _grid       = [bytearray(_n_cells) for _ in range(_n_cells)]
+    _hit_count  = [bytearray(_n_cells) for _ in range(_n_cells)]
+    _miss_count = [bytearray(_n_cells) for _ in range(_n_cells)]
     _free_count     = 0
     _occupied_count = 0
     _free_bbox[:]     = [None, None, None, None]
     _occupied_bbox[:] = [None, None, None, None]
+    _last_scan_pose   = None
 
 
-# ── Reporting ────────────────────────────────────────────────────────────────
+# ── Reporting ─────────────────────────────────────────────────────────────────
 
 def _format_bbox_line(label, bbox):
     if bbox[0] is None:
@@ -291,14 +397,7 @@ def _format_bbox_line(label, bbox):
 
 
 def summary(robot_xy=None):
-    """Format a multi-line summary of the grid state.
-
-    Parameters
-    ----------
-    robot_xy : (x, y), optional
-        Current robot pose in world metres.  When provided, the summary
-        also reports the robot's grid index.
-    """
+    """Format a multi-line summary of the grid state."""
     total   = _n_cells * _n_cells
     unknown = total - _free_count - _occupied_count
 
