@@ -98,14 +98,26 @@ def bearing_distance_from_pose(pose, world_position):
 _target_memory = {"blue": None, "yellow": None}
 
 
+# Minimum camera depth accepted for a memory update.  Readings below this
+# are almost certainly camera saturation or edge noise when the robot is
+# very close — not a reliable world-position sighting.
+_MIN_MEMORY_DIST_M = 0.35
+
+
 def update_target_memory(color, pose, bearing_rad, distance_m):
     """Project the current observation and store it as the latest sighting.
 
-    Silently no-op if the projection fails (any None / non-finite input)
-    or if `color` is not a tracked target.
+    Silently no-op when:
+    - any input is None or non-finite
+    - color is not a tracked target
+    - distance_m < _MIN_MEMORY_DIST_M (saturated / noise reading)
     """
     if color not in _target_memory:
         return
+    if distance_m is None or not math.isfinite(distance_m):
+        return
+    if distance_m < _MIN_MEMORY_DIST_M:
+        return   # camera too close / saturated — position would be wrong
     wp = target_world_position(pose, bearing_rad, distance_m)
     if wp is None:
         return

@@ -16,12 +16,15 @@ import motion
 import localization
 import mapping
 import perception
+import visualizer
+import waypoint_controller
 from autonomous import autonomous_step, reset_autonomous_state, reset_mission_state
 from sensor_debug import format_compact_sensors, format_sensor_snapshot
 from config import (
     TARGET_LIN_VEL, TARGET_ANG_VEL, FRONT_STOP_DIST,
     POSE_LOG_PERIOD_STEPS,
     LASER_RANGE_REJECT_MARGIN_M,
+    VIZ_SAVE_PERIOD_STEPS,
 )
 
 # ── Controller state ───────────────────────────────────────────────────────────
@@ -36,7 +39,7 @@ print(
     "Controller ready.  Keys: F/S/A/D drive | Space stop | T self-test | "
     "G autonomous mode | I sensor snapshot | L toggle sensor log | "
     "O pose snapshot | R reset pose & map | M map summary | "
-    "P target bearings"
+    "P target bearings | V save map PNG"
 )
 
 
@@ -105,6 +108,16 @@ while devices.robot.step(devices.timestep) != -1:
         rx, ry, _ = localization.get_pose()
         print(mapping.summary(robot_xy=(rx, ry)))
 
+    if ord('V') in new_keys or ord('v') in new_keys:
+        _pose = localization.get_pose()
+        visualizer.save_map(
+            "map.png",
+            robot_pose=_pose,
+            path=waypoint_controller.remaining_waypoints(),
+            blue_pos=perception.get_target_memory("blue"),
+            yellow_pos=perception.get_target_memory("yellow"),
+        )
+
     if ord('P') in new_keys or ord('p') in new_keys:
         _colors = sensors.read_color_detections()
         _pose   = localization.get_pose()
@@ -152,15 +165,18 @@ while devices.robot.step(devices.timestep) != -1:
         )
 
         if step_count % 10 == 0:
+            _ld = dbg['live_dist']
+            _ld_str = f"{_ld:.2f}m" if _ld is not None else "None"
             print(
                 f"[COLOR] green={dbg['green']}:{dbg['green_ratio']:.3f} "
                 f"dist={dbg['green_distance']:.3f} "
                 f"blue={dbg['blue']}:{dbg['blue_ratio']:.3f} "
                 f"yellow={dbg['yellow']}:{dbg['yellow_ratio']:.3f} | "
-                f"target={dbg['active_target']} mission={dbg['mission_state']} | "
-                f"overhead={dbg['overhead_front']:.3f} "
-                f"block_timer={dbg['block_timer']} | "
-                f"{sel_label} v={v_cmd:+.2f} omega={omega_cmd:+.2f}"
+                f"target={dbg['active_target']} mission={dbg['mission_state']} "
+                f"nav={dbg['nav_mode']} wp={dbg['wp_remaining']} | "
+                f"live={dbg['live_color']} d={_ld_str} | "
+                f"block={dbg['block_timer']} | "
+                f"{sel_label} v={v_cmd:+.2f} ω={omega_cmd:+.2f}"
             )
 
     else:
@@ -191,3 +207,14 @@ while devices.robot.step(devices.timestep) != -1:
     # ── Periodic pose log ─────────────────────────────────────────────────────
     if step_count % POSE_LOG_PERIOD_STEPS == 0:
         print(f"[POSE] {localization.format_pose()}")
+
+    # ── Periodic map auto-save ────────────────────────────────────────────────
+    if VIZ_SAVE_PERIOD_STEPS > 0 and step_count % VIZ_SAVE_PERIOD_STEPS == 0:
+        _ap = localization.get_pose()
+        visualizer.save_map(
+            f"map_step{step_count:06d}.png",
+            robot_pose=_ap,
+            path=waypoint_controller.remaining_waypoints(),
+            blue_pos=perception.get_target_memory("blue"),
+            yellow_pos=perception.get_target_memory("yellow"),
+        )

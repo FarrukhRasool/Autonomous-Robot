@@ -444,9 +444,10 @@ def read_color_detections():
 
         result["blue_bearing_rad"] = _pixel_to_bearing(bcol, w, _rgb_fov)
 
-        # ✅ Use robust region-based depth
+        # 25th-percentile depth: robust against single-pixel edge/reflection
+        # noise that min() would pick up as a falsely short distance.
         if blue_depths:
-            result["blue_distance_m"] = min(blue_depths)
+            result["blue_distance_m"] = _percentile(blue_depths, 4)
 
     # ✅ YELLOW processing (FINAL CORRECT)
     if result["yellow"] and yellow_centroid is not None:
@@ -454,9 +455,8 @@ def read_color_detections():
 
         result["yellow_bearing_rad"] = _pixel_to_bearing(ycol, w, _rgb_fov)
 
-        # ✅ Use robust region-based depth
         if yellow_depths:
-            result["yellow_distance_m"] = min(yellow_depths)
+            result["yellow_distance_m"] = _percentile(yellow_depths, 4)
 
     return result
 
