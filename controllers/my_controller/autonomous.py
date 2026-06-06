@@ -19,7 +19,7 @@ from config import (
     WALL_TARGET_DIST, WALL_CLOSE_BAND, WALL_LOST_DIST, SIDE_DANGER_DIST,
     OMEGA_SMALL, BLOCK_TIMEOUT, REAR_SAFE_DIST,
     GREEN_STOP_DIST, GREEN_CAUTION_DIST,
-    OVERHEAD_DETECT_DIST,
+    OVERHEAD_DETECT_DIST, FLOATING_WALL_STOP_DIST, FLOATING_WALL_CAUTION_DIST,
     SEEK_LIN_VEL, SEEK_OMEGA, SEEK_BEARING_DEADBAND_RAD,
     TARGET_REACHED_DIST_M,
 )
@@ -41,6 +41,7 @@ _mission_state = SEEKING_BLUE
 
 _block_latched = False
 _block_open_side = None
+_floating_wall_turn_side = None
 
 
 def _choose_open_side(left_min, right_min):
@@ -50,9 +51,10 @@ def _choose_open_side(left_min, right_min):
 
 def reset_autonomous_state():
     """Clear short-term navigation memory when autonomous mode is reset."""
-    global _block_latched, _block_open_side
+    global _block_latched, _block_open_side, _floating_wall_turn_side
     _block_latched = False
     _block_open_side = None
+    _floating_wall_turn_side = None
 
 
 def reset_mission_state():
@@ -67,12 +69,53 @@ def mission_state_name():
     return _MISSION_NAMES.get(_mission_state, "?")
 
 
-def _fuse_front_clearance(laser_front):
-    """Fuse laser front range with overhead depth without hiding close laser blocks."""
-    _, _, overhead_front = sensors.overhead_depth_regions(OVERHEAD_DETECT_DIST)
-    if laser_front > FRONT_CAUTION_DIST:
-        return min(laser_front, overhead_front), overhead_front
-    return laser_front, overhead_front
+def _turn_side_from_floating_wall(region, left_min, right_min):
+    """Choose the direction that turns the robot away from a depth obstacle.
+
+    Image/depth region convention matches the camera view:
+        wall on left  -> rotate right (negative omega)
+        wall on right -> rotate left  (positive omega)
+        wall centered -> use whichever laser side currently has more clearance
+    """
+    if region == "left":
+        return "right"
+    if region == "right":
+        return "left"
+    return _choose_open_side(left_min, right_min)
+
+
+def _apply_floating_wall_avoidance(v_cmd, omega_cmd, label,
+                                   region, depth, left_min, right_min):
+    """Stop or slow the forward command when the depth camera sees a floating wall."""
+    global _floating_wall_turn_side
+
+    if not math.isfinite(depth):
+        _floating_wall_turn_side = None
+        return v_cmd, omega_cmd, label
+
+    if depth <= FLOATING_WALL_STOP_DIST:
+        _floating_wall_turn_side = _turn_side_from_floating_wall(
+            region, left_min, right_min
+        )
+        sign = 1.0 if _floating_wall_turn_side == "left" else -1.0
+        return (
+            0.0,
+            sign * TARGET_ANG_VEL,
+            f"floating_wall_stop_turn_{_floating_wall_turn_side}",
+        )
+
+    if depth <= FLOATING_WALL_CAUTION_DIST and v_cmd > 0:
+        turn_side = _turn_side_from_floating_wall(region, left_min, right_min)
+        _floating_wall_turn_side = turn_side
+        sign = 1.0 if turn_side == "left" else -1.0
+        return (
+            min(v_cmd, CAUTION_LIN_VEL),
+            sign * OMEGA_SMALL,
+            f"floating_wall_caution_turn_{turn_side}",
+        )
+
+    _floating_wall_turn_side = None
+    return v_cmd, omega_cmd, label
 
 
 def _active_target_bearing(colors, pose):
@@ -206,7 +249,11 @@ def autonomous_step(block_timer, pose=None):
             pass
     far_left, left_min, center_min, right_min, far_right = laser_5_sectors(raw_ranges)
 
-    center_min, overhead_min = _fuse_front_clearance(center_min)
+    floating_detected, floating_region, floating_depth = (
+        sensors.floating_wall_depth_regions(OVERHEAD_DETECT_DIST)
+    )
+    if center_min > FRONT_CAUTION_DIST:
+        center_min = min(center_min, floating_depth)
 
     # ── Short-range sensors ────────────────────────────────────────────────────
     fl_val = devices.fl_range.getValue() if devices.fl_range else float('inf')
@@ -301,6 +348,16 @@ def autonomous_step(block_timer, pose=None):
             omega_cmd = TARGET_ANG_VEL
             label     = "front_emg_turn_left"
 
+    # ── Floating-wall safety: depth-camera obstacle above laser plane ─────────
+    # Floating walls may have no ground-touching pixels, so the laser can see
+    # free space while the depth camera sees a real obstacle in the image.
+    v_cmd, omega_cmd, label = _apply_floating_wall_avoidance(
+        v_cmd, omega_cmd, label,
+        floating_region if floating_detected else "none",
+        floating_depth,
+        left_min, right_min,
+    )
+
     # ── Rear safety: block reverse when rear sensors are close ─────────────────
     if v_cmd < 0 and (rl_val < REAR_SAFE_DIST or rr_val < REAR_SAFE_DIST):
         v_cmd     = 0.0
@@ -339,7 +396,10 @@ def autonomous_step(block_timer, pose=None):
         "blue_ratio":     colors["blue_ratio"],
         "yellow":         colors["yellow"],
         "yellow_ratio":   colors["yellow_ratio"],
-        "overhead_front": overhead_min,
+        "overhead_front": floating_depth,
+        "floating_wall":  floating_detected,
+        "floating_region": floating_region,
+        "floating_depth": floating_depth,
         "block_timer":    block_timer,
         "active_target":  active_color,
         "mission_state":  _MISSION_NAMES[_mission_state],
