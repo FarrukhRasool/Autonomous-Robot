@@ -16,6 +16,9 @@ FRONT_CAUTION_DIST = 0.35  # m — caution zone entry; slow down and steer
 
 # ── Overhead/floating obstacle depth safety ───────────────────────────────────
 OVERHEAD_DETECT_DIST = 1.00  # m — depth ROI max range for floating obstacles
+FLOATING_WALL_STOP_DIST = 0.60  # m — stop/turn when a floating wall is close
+FLOATING_WALL_CAUTION_DIST = 0.98  # m — slow/steer away from farther floating walls
+FLOATING_WALL_MIN_PIXELS = 10  # sampled depth pixels needed before a ROI counts
 
 # ── Caution zone speeds ───────────────────────────────────────────────────────
 CAUTION_LIN_VEL = 0.20  # m/s   — reduced forward speed in caution zone

@@ -81,7 +81,10 @@ def is_plausible(name, value):
             )
         )
     
-    if name in ("overhead_left", "overhead_center", "overhead_right"):
+    if name in (
+            "overhead_left", "overhead_center", "overhead_right",
+            "floating_wall_left", "floating_wall_center", "floating_wall_right",
+    ):
         return value is not None and isinstance(value, (int, float))
 
     if name == "cam_depth":
@@ -225,6 +228,9 @@ def format_sensor_snapshot(readings):
         overhead_left = readings.get("overhead_left")
         overhead_center = readings.get("overhead_center")
         overhead_right = readings.get("overhead_right")
+        floating_left = readings.get("floating_wall_left")
+        floating_center = readings.get("floating_wall_center")
+        floating_right = readings.get("floating_wall_right")
 
         def fmt_overhead(v):
             return f"{v:.3f}m" if _fin(v) else str(v)
@@ -233,6 +239,11 @@ def format_sensor_snapshot(readings):
             f"  overhead  : left={fmt_overhead(overhead_left)}"
             f"  center={fmt_overhead(overhead_center)}"
             f"  right={fmt_overhead(overhead_right)}"
+        )
+        lines.append(
+            f"  floating  : left={fmt_overhead(floating_left)}"
+            f"  center={fmt_overhead(floating_center)}"
+            f"  right={fmt_overhead(floating_right)}"
         )
 
     lines.append("=" * 46)

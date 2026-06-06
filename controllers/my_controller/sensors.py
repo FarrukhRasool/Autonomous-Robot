@@ -8,7 +8,8 @@ import math
 
 import devices
 from config import (
-    GREEN_DEPTH_MIN_VALID, GREEN_PIXEL_RATIO, TARGET_PIXEL_RATIO, FRONT_BLOCK_DIST
+    GREEN_DEPTH_MIN_VALID, GREEN_PIXEL_RATIO, TARGET_PIXEL_RATIO,
+    FLOATING_WALL_MIN_PIXELS
 )
 
 
@@ -269,8 +270,50 @@ def _read_depth_center():
         return None
     return w, h, data[h // 2 * w + w // 2]
 
-def overhead_depth_regions(max_distance):
-    """Detect overhead/floating obstacles in upper-left, upper-center, upper-right depth ROIs.
+def _depth_roi_near_value(data, w, h, roi, step=3):
+    """Return a robust nearest depth and sample count for a fractional ROI.
+
+    Depth cameras can see floating walls even when laser/range sensors miss
+    them because the wall pixels do not touch the ground.  A low percentile is
+    used instead of the absolute minimum so one noisy pixel does not dominate.
+    """
+    x0f, x1f, y0f, y1f = roi
+    col_start = max(0, min(w, int(x0f * w)))
+    col_end = max(0, min(w, int(x1f * w)))
+    row_start = max(0, min(h, int(y0f * h)))
+    row_end = max(0, min(h, int(y1f * h)))
+
+    vals = []
+    for row in range(row_start, row_end, step):
+        base = row * w
+        for col in range(col_start, col_end, step):
+            v = data[base + col]
+            if math.isfinite(v) and v > GREEN_DEPTH_MIN_VALID:
+                vals.append(v)
+
+    if not vals:
+        return INF, 0
+
+    vals.sort()
+    return vals[max(0, len(vals) // 20)], len(vals)
+
+
+def _floating_wall_rois():
+    """Left/center/right depth bands spanning upper through mid image.
+
+    The lower image rows are avoided because they are often ordinary ground,
+    not a floating obstacle.  The mid rows catch walls whose pixels do not
+    extend all the way down to the floor.
+    """
+    return {
+        "left":   (0.05, 0.42, 0.04, 0.72),
+        "center": (0.24, 0.76, 0.04, 0.72),
+        "right":  (0.58, 0.95, 0.04, 0.72),
+    }
+
+
+def floating_wall_depth_regions(max_distance):
+    """Detect floating/front obstacles in tall left/center/right depth ROIs.
 
     Returns:
         detected: bool
@@ -281,35 +324,13 @@ def overhead_depth_regions(max_distance):
     if data is None:
         return False, "none", INF
 
-    rois = {
-        "left":   (0.05, 0.40, 0.02, 0.55),
-        "center": (0.25, 0.75, 0.02, 0.55),
-        "right":  (0.60, 0.95, 0.02, 0.55),
-    }
-
     best_region = "none"
     best_depth = INF
 
-    for name, (x0f, x1f, y0f, y1f) in rois.items():
-        col_start = int(x0f * w)
-        col_end   = int(x1f * w)
-        row_start = int(y0f * h)
-        row_end   = int(y1f * h)
-
-        vals = []
-
-        for row in range(row_start, row_end, 3):
-            base = row * w
-            for col in range(col_start, col_end, 3):
-                v = data[base + col]
-                if math.isfinite(v) and v > GREEN_DEPTH_MIN_VALID:
-                    vals.append(v)
-
-        if not vals:
+    for name, roi in _floating_wall_rois().items():
+        depth_near, count = _depth_roi_near_value(data, w, h, roi)
+        if count < FLOATING_WALL_MIN_PIXELS:
             continue
-
-        vals.sort()
-        depth_near = vals[max(0, len(vals) // 20)]  # 5th percentile
 
         if depth_near < best_depth:
             best_depth = depth_near
@@ -318,51 +339,48 @@ def overhead_depth_regions(max_distance):
     detected = best_depth < max_distance
     return detected, best_region, best_depth
 
-def overhead_depth_region_values():
-    """Return robust depth values for overhead left/center/right ROIs.
 
-    These are the same ROIs used by overhead_depth_regions().
+def overhead_depth_regions(max_distance):
+    """Backward-compatible alias for floating-wall depth detection."""
+    return floating_wall_depth_regions(max_distance)
+
+
+def floating_wall_depth_region_values():
+    """Return robust depth values for floating-wall left/center/right ROIs.
+
+    These are the same tall ROIs used by floating_wall_depth_regions().
     Returns inf for a region if no valid depth pixels exist.
     """
     data, w, h = _read_depth_image()
     if data is None:
         return {
-            "overhead_left": INF,
-            "overhead_center": INF,
-            "overhead_right": INF,
+            "floating_wall_left": INF,
+            "floating_wall_center": INF,
+            "floating_wall_right": INF,
         }
-
-    rois = {
-        "overhead_left":   (0.05, 0.40, 0.02, 0.55),
-        "overhead_center": (0.25, 0.75, 0.02, 0.55),
-        "overhead_right":  (0.60, 0.95, 0.02, 0.55),
-    }
 
     result = {}
 
-    for name, (x0f, x1f, y0f, y1f) in rois.items():
-        col_start = int(x0f * w)
-        col_end   = int(x1f * w)
-        row_start = int(y0f * h)
-        row_end   = int(y1f * h)
-
-        vals = []
-
-        for row in range(row_start, row_end, 3):
-            base = row * w
-            for col in range(col_start, col_end, 3):
-                v = data[base + col]
-                if math.isfinite(v) and v > GREEN_DEPTH_MIN_VALID:
-                    vals.append(v)
-
-        if not vals:
+    for region, roi in _floating_wall_rois().items():
+        depth_near, count = _depth_roi_near_value(data, w, h, roi)
+        name = f"floating_wall_{region}"
+        if count < FLOATING_WALL_MIN_PIXELS:
             result[name] = INF
             continue
 
-        vals.sort()
-        result[name] = vals[max(0, len(vals) // 20)]  # 5th percentile
+        result[name] = depth_near
 
     return result
+
+
+def overhead_depth_region_values():
+    """Backward-compatible alias for floating-wall depth debug values."""
+    values = floating_wall_depth_region_values()
+    return {
+        "overhead_left": values["floating_wall_left"],
+        "overhead_center": values["floating_wall_center"],
+        "overhead_right": values["floating_wall_right"],
+    }
 
 
 def get_front_laser_min():
@@ -485,4 +503,5 @@ def read_sensor_snapshot():
     r["colors"] = read_color_detections()
     r["cam_depth"] = _read_depth_center()
     r.update(overhead_depth_region_values())
+    r.update(floating_wall_depth_region_values())
     return r

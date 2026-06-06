@@ -158,7 +158,8 @@ while devices.robot.step(devices.timestep) != -1:
                 f"blue={dbg['blue']}:{dbg['blue_ratio']:.3f} "
                 f"yellow={dbg['yellow']}:{dbg['yellow_ratio']:.3f} | "
                 f"target={dbg['active_target']} mission={dbg['mission_state']} | "
-                f"overhead={dbg['overhead_front']:.3f} "
+                f"floating={dbg['floating_wall']}:{dbg['floating_region']} "
+                f"dist={dbg['floating_depth']:.3f} "
                 f"block_timer={dbg['block_timer']} | "
                 f"{sel_label} v={v_cmd:+.2f} omega={omega_cmd:+.2f}"
             )
