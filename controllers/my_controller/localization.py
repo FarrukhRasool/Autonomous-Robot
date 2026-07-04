@@ -27,6 +27,7 @@ Per-step:
 import math
 
 from kinematics import WHEEL_RADIUS_M, WHEEL_TRACK_M
+from config import SLIP_ENC_ROT_RAD, SLIP_GYRO_RATE_RADS
 
 
 _x = 0.0
@@ -64,7 +65,21 @@ def get_pose():
     return _x, _y, _theta
 
 
-def update_from_encoders(left_rad, right_rad, imu_yaw=None):
+def get_position():
+    """Return (x_m, y_m) — the translational part of the pose.
+
+    Compatibility accessor for AURE-derived modules (mapping, planning) that
+    consume position and heading separately from the full pose.
+    """
+    return _x, _y
+
+
+def get_heading(unit='rad'):
+    """Return the current heading; unit='rad' (default) or 'deg'."""
+    return math.degrees(_theta) if unit == 'deg' else _theta
+
+
+def update_from_encoders(left_rad, right_rad, imu_yaw=None, gyro_z=None):
     """Integrate one step of IMU-fused wheel odometry.
 
     Parameters
@@ -76,6 +91,10 @@ def update_from_encoders(left_rad, right_rad, imu_yaw=None):
         World-frame yaw from the inertial_unit (radians).  When provided
         and finite, replaces wheel-derived theta.  When None, the function
         falls back to wheel-only integration.
+    gyro_z : float, optional
+        IMU gyro yaw rate (rad/s).  Enables the rotational wheel-slip gate:
+        when the encoders claim a turn the gyro does not confirm, the
+        position update is suppressed.  When None, the gate is disabled.
 
     On the first call (or first call after reset), the baseline values are
     captured and no pose integration happens — pose stays (0, 0, 0).
@@ -118,6 +137,18 @@ def update_from_encoders(left_rad, right_rad, imu_yaw=None):
         # Wheel-only fallback: derive d_theta from the encoder difference.
         d_theta_wheels = (d_right - d_left) / WHEEL_TRACK_M
         theta_new = _wrap_angle(_theta + d_theta_wheels)
+
+    # ── Rotational wheel-slip gate (ported from AURE update_odometry) ─────────
+    # If the encoders claim the robot is rotating but the gyro says the body is
+    # not actually turning, the wheels are slipping in place (e.g. one side
+    # pinned against a wall).  Keep the heading (drift-free IMU) but suppress
+    # the phantom position delta so the map isn't corrupted by fake motion.
+    encoder_dtheta = (d_right - d_left) / WHEEL_TRACK_M
+    if (gyro_z is not None
+            and abs(encoder_dtheta) > SLIP_ENC_ROT_RAD
+            and abs(gyro_z) < SLIP_GYRO_RATE_RADS):
+        _theta = theta_new
+        return _x, _y, _theta
 
     # Midpoint heading using the signed shortest delta — robust across the
     # +pi/-pi wrap boundary.
