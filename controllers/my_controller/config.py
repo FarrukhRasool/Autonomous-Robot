@@ -66,7 +66,8 @@ GREEN_CAUTION_DIST = 0.75  # m — green ahead; slow down and steer away
 GREEN_MARK_ENABLED  = True   # set False to rely on the reactive net only
 GREEN_CAM_HEIGHT_M  = 0.17   # RGB camera height above the floor (tune per robot)
 GREEN_CAM_X_OFFSET  = 0.03   # camera forward offset from robot centre (m)
-GREEN_MAX_PROJ_DIST = 4.0    # m — ignore projected green ground beyond this range
+GREEN_MAX_PROJ_DIST = 1.2    # m — only mark nearby green; far projection smears into streaks
+GREEN_MARK_MIN_PIXELS = 60   # min green pixels in the lower image before marking (reject noise)
 
 # ── Localization ──────────────────────────────────────────────────────────────
 POSE_LOG_PERIOD_STEPS = 50  # steps between automatic pose log lines
