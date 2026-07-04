@@ -17,7 +17,7 @@ from config import (
     YELLOW_HSV_LOWER, YELLOW_HSV_UPPER,
     GREEN_HSV_LOWER, GREEN_HSV_UPPER,
     COLUMN_HEIGHT_CM, COLUMN_DIST_OFFSET_CM, COLUMN_TOP_STRIP_PX,
-    GREEN_CAM_HEIGHT_M, GREEN_CAM_X_OFFSET, GREEN_MAX_PROJ_DIST,
+    GREEN_CAM_HEIGHT_M, GREEN_CAM_X_OFFSET, GREEN_MAX_PROJ_DIST, GREEN_MARK_MIN_PIXELS,
 )
 
 
@@ -270,7 +270,7 @@ def green_ground_points_body():
     h, w = mask.shape
     mask[:int(GREEN_ROI_TOP_FRAC * h), :] = 0     # trust only the lower image (floor)
     vs, us = np.where(mask == 255)                # rows (v), cols (u)
-    if us.size == 0:
+    if us.size < GREEN_MARK_MIN_PIXELS:           # reject stray green (noise -> streaks)
         return empty
     if us.size > 400:                             # subsample dense masks
         idx = np.linspace(0, us.size - 1, 400).astype(int)
