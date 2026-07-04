@@ -196,11 +196,12 @@ def mark_green(pose, points_local):
 def mark_robot_free(pose, radius_cells=2):
     """Force the robot's own footprint to FREE, correcting phantom walls.
 
-    The robot is physically at this pose, so any OCCUPIED cell under its body
-    must be spurious (e.g. from odometry slip while wedged).  We reset those
-    cells' log-odds to strongly-free — this also clears the sticky-wall lock, so
-    driving back through a distorted area now repairs it.  GREEN / CLOSED
-    semantic markers are preserved.
+    The robot is physically at this pose, so any OCCUPIED or GREEN cell under
+    its body must be spurious — a phantom wall from odometry slip, or a
+    mis-projected green streak (the robot is never allowed onto real green).
+    We reset those cells to strongly-free, also clearing the sticky-wall lock so
+    driving back through a distorted area repairs it.  CLOSED (deliberate
+    corridor closures) are preserved.
     """
     if pose is None:
         return
@@ -213,7 +214,7 @@ def mark_robot_free(pose, radius_cells=2):
             cx, cy = mx + dx, my + dy
             if not (0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE):
                 continue
-            if _grid[cy, cx] == CELL_GREEN or _grid[cy, cx] == CELL_CLOSED:
+            if _grid[cy, cx] == CELL_CLOSED:
                 continue
             _log_odds[cy, cx] = -LOGODDS_CLIP      # strongly free; clears any lock
             _grid[cy, cx] = CELL_FREE
