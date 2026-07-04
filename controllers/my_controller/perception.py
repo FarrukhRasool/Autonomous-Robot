@@ -117,6 +117,12 @@ def get_target_memory(color):
     return _target_memory.get(color)
 
 
+def forget_target(color):
+    """Drop the stored sighting for one color (e.g. a stale/wrong memory)."""
+    if color in _target_memory:
+        _target_memory[color] = None
+
+
 def reset_target_memory():
     """Clear all stored sightings (called by the R keypress)."""
     for key in _target_memory:

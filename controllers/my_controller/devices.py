@@ -80,6 +80,11 @@ _enable(camera_depth, "camera depth")
 # ── Laser ─────────────────────────────────────────────────────────────────────
 laser = _get("laser")
 _enable(laser, "laser")
+if laser is not None:
+    try:
+        laser.enablePointCloud()   # required by mapping.read_lidar_pointcloud_2d
+    except Exception:
+        print("Could not enable laser point cloud")
 
 # ── Keyboard ──────────────────────────────────────────────────────────────────
 keyboard = robot.getKeyboard()
