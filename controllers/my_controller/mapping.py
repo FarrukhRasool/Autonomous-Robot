@@ -193,6 +193,32 @@ def mark_green(pose, points_local):
             _grid[my, mx] = CELL_GREEN
 
 
+def mark_robot_free(pose, radius_cells=2):
+    """Force the robot's own footprint to FREE, correcting phantom walls.
+
+    The robot is physically at this pose, so any OCCUPIED cell under its body
+    must be spurious (e.g. from odometry slip while wedged).  We reset those
+    cells' log-odds to strongly-free — this also clears the sticky-wall lock, so
+    driving back through a distorted area now repairs it.  GREEN / CLOSED
+    semantic markers are preserved.
+    """
+    if pose is None:
+        return
+    mx, my = world_to_map(pose[0], pose[1])
+    r2 = radius_cells * radius_cells
+    for dy in range(-radius_cells, radius_cells + 1):
+        for dx in range(-radius_cells, radius_cells + 1):
+            if dx * dx + dy * dy > r2:
+                continue
+            cx, cy = mx + dx, my + dy
+            if not (0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE):
+                continue
+            if _grid[cy, cx] == CELL_GREEN or _grid[cy, cx] == CELL_CLOSED:
+                continue
+            _log_odds[cy, cx] = -LOGODDS_CLIP      # strongly free; clears any lock
+            _grid[cy, cx] = CELL_FREE
+
+
 def there_is_obstacle(map_cell):
     """True if the given (map_x, map_y) cell is OCCUPIED / GREEN / CLOSED.
 
@@ -245,33 +271,45 @@ def _png_chunk(tag, payload):
             + struct.pack(">I", zlib.crc32(tag + payload) & 0xffffffff))
 
 
-def save_png(path="map.png", path_cells=None):
-    """Dump the grid as a viewable 8-bit grayscale PNG (pure stdlib, no OpenCV).
+def save_png(path="map.png", path_cells=None, blue_cell=None, yellow_cell=None):
+    """Dump the grid as a viewable RGB PNG (pure stdlib, no OpenCV).
 
-    OBSTACLE->black, FREESPACE->white, UNKNOWN->mid-gray, CLOSED/GREEN darker.
-    If `path_cells` (list of (x, y) map cells) is given, the route is drawn on
-    top as a distinct mid-gray.  PNG opens in Preview/QuickLook.  Returns path.
+    OBSTACLE->black, FREESPACE->white, UNKNOWN->gray, GREEN->green, CLOSED->purple.
+    The route (if given) is drawn red; the blue/yellow pillars in their own
+    colours.  PNG opens in Preview/QuickLook.  Returns the path.
     """
-    img = np.full((MAP_SIZE, MAP_SIZE), 128, dtype=np.uint8)  # UNKNOWN gray
-    img[_grid == CELL_FREE] = 255
-    img[_grid == CELL_OCC] = 0
-    img[_grid == CELL_CLOSED] = 64
-    img[_grid == CELL_GREEN] = 96
+    img = np.zeros((MAP_SIZE, MAP_SIZE, 3), dtype=np.uint8)
+    img[_grid == CELL_UNKNOWN] = (128, 128, 128)
+    img[_grid == CELL_FREE] = (255, 255, 255)
+    img[_grid == CELL_OCC] = (0, 0, 0)
+    img[_grid == CELL_CLOSED] = (128, 0, 128)
+    img[_grid == CELL_GREEN] = (0, 180, 0)
 
     if path_cells:
         for (x, y) in path_cells:
             if 0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE:
-                img[y, x] = 200   # route overlay (distinct gray)
+                img[y, x] = (255, 0, 0)       # red route
 
-    h, w = img.shape
-    pix = img.tobytes()
+    def _dot(cell, rgb):
+        if cell is None:
+            return
+        cx, cy = int(cell[0]), int(cell[1])
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
+                    img[ny, nx] = rgb
+    _dot(blue_cell, (0, 0, 255))              # blue pillar
+    _dot(yellow_cell, (255, 255, 0))          # yellow pillar
+
+    h, w, _ = img.shape
     raw = bytearray()
     for y in range(h):
-        raw.append(0)                       # PNG per-row filter type 0 (None)
-        raw += pix[y * w:(y + 1) * w]
+        raw.append(0)                          # PNG per-row filter type 0 (None)
+        raw += img[y].tobytes()                # RGB row (R,G,B per pixel)
 
     png = (b"\x89PNG\r\n\x1a\n"
-           + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 0, 0, 0, 0))
+           + _png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))  # colour type 2 = RGB
            + _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
            + _png_chunk(b"IEND", b""))
     with open(path, "wb") as f:
