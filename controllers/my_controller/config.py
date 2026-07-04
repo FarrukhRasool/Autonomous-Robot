@@ -32,6 +32,13 @@ OMEGA_SMALL      = 0.22  # rad/s — gentle wall-correction angular rate
 BLOCK_TIMEOUT  = 40    # steps — front-blocked steps before timeout recovery activates
 REAR_SAFE_DIST = 0.25  # m     — rear range below which reverse is forbidden
 
+# Safety-net wall-block escape: turn decisively; if the front stays blocked past
+# the timeout, reverse out (dead-end / tight corner) then try the other side.
+FRONT_BLOCK_TIMEOUT_STEPS  = 20    # decisive-turn ticks before escalating to a reverse
+FRONT_ESCAPE_REVERSE_STEPS = 25    # ticks spent reversing to clear the block
+FRONT_ESCAPE_REVERSE_VEL   = -0.12 # m/s reverse speed during the escape
+FRONT_ESCAPE_TURN_OMEGA    = 0.8   # rad/s — arc while reversing to back out and re-orient
+
 # ── HSV semantic detection (AURE cv2 approach) ────────────────────────────────
 # HSV colour bands (OpenCV hue 0-179).  Ported from AURE CONSTANTS.
 BLUE_HSV_LOWER   = [100, 150,  50]
@@ -109,8 +116,8 @@ ASTAR_HEURISTIC_WEIGHT = 1.2        # A* heuristic multiplier (matches AURE)
 # ── DWA local path follower (AURE) ────────────────────────────────────────────
 DWA_VELOCITY_SAMPLES = [0.0, 0.1, 0.2, 0.3]   # m/s; 0.0 lets DWA rotate in place to escape
 DWA_ANGULAR_SAMPLES  = [0.0, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 2.5, -2.5]  # rad/s (gentler)
-DWA_ROLLOUT_STEPS    = 20    # forward-prediction horizon (control steps) — sees walls before the emergency band
-DWA_ROBOT_RADIUS_PX  = 1     # px — hard-reject trajectories within this of a wall (body width)
+DWA_ROLLOUT_STEPS    = 15    # forward-prediction horizon (control steps)
+DWA_ROBOT_RADIUS_PX  = 3     # px — true robot half-width; keeps the body clear so it can't wedge
 DWA_HEADING_WEIGHT   = 4.0   # reward facing the target
 DWA_DISTANCE_WEIGHT  = 3.5   # reward closing distance to the target
 DWA_SPEED_WEIGHT     = 0.5   # reward higher speed
@@ -151,3 +158,5 @@ SEEK_BEARING_DEADBAND_RAD = 0.10  # rad   — |bearing| at or below this counts 
 
 # ── Mission ───────────────────────────────────────────────────────────────────
 TARGET_REACHED_DIST_M     = 0.50  # m     — depth-at-centroid below this counts as reached
+APPROACH_OFFSET_M         = 0.40  # m     — aim this far in front of a pillar (its cell is an obstacle)
+MISSION_REACHED_RATIO     = 0.25  # frame fraction a pillar fills that also counts as reached
