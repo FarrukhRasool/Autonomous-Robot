@@ -1,4 +1,4 @@
-Read CLAUDE.md and docs/specs/001-rosbot-navigation.md.
+Read CLAUDE.md and .claude/specs/001-rosbot-navigation.md.
 
 Then inspect the current project files.
 
