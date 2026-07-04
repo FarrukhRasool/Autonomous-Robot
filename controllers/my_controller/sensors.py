@@ -6,9 +6,18 @@ Pure data functions — no control logic.
 
 import math
 
+import numpy as np
+import cv2
+
 import devices
 from config import (
-    GREEN_DEPTH_MIN_VALID, GREEN_PIXEL_RATIO, TARGET_PIXEL_RATIO, FRONT_BLOCK_DIST
+    GREEN_DEPTH_MIN_VALID, GREEN_PIXEL_RATIO, TARGET_PIXEL_RATIO, FRONT_BLOCK_DIST,
+    GREEN_ROI_TOP_FRAC,
+    BLUE_HSV_LOWER, BLUE_HSV_UPPER,
+    YELLOW_HSV_LOWER, YELLOW_HSV_UPPER,
+    GREEN_HSV_LOWER, GREEN_HSV_UPPER,
+    COLUMN_HEIGHT_CM, COLUMN_DIST_OFFSET_CM, COLUMN_TOP_STRIP_PX,
+    GREEN_CAM_HEIGHT_M, GREEN_CAM_X_OFFSET, GREEN_MAX_PROJ_DIST,
 )
 
 
@@ -17,14 +26,6 @@ INF = float('inf')
 
 def _is_valid_range(v, min_valid):
     return math.isfinite(v) and v > min_valid
-
-
-def _percentile(values, percentile_index):
-    if not values:
-        return INF
-    values.sort()
-    idx = max(0, min(len(values) - 1, len(values) // percentile_index))
-    return values[idx]
 
 
 def _safe_call(sensor, method, default=None):
@@ -71,78 +72,83 @@ def _rgb_at(img, w, row, col):
     return r, g, b
 
 
-def _depth_at_rgb_pixel(depth_data, depth_w, depth_h, rgb_w, rgb_h, row, col):
-    if not depth_data or depth_w == 0 or depth_h == 0:
+# HSV colour bands (OpenCV hue 0-179), built once from config.
+_HSV_BANDS = {
+    "blue":   (np.array(BLUE_HSV_LOWER,   np.uint8), np.array(BLUE_HSV_UPPER,   np.uint8)),
+    "yellow": (np.array(YELLOW_HSV_LOWER, np.uint8), np.array(YELLOW_HSV_UPPER, np.uint8)),
+    "green":  (np.array(GREEN_HSV_LOWER,  np.uint8), np.array(GREEN_HSV_UPPER,  np.uint8)),
+}
+
+
+def _get_hsv_image():
+    """RGB camera frame as an HSV numpy image (h, w, 3), or None if unavailable."""
+    img, w, h = _read_camera_image(devices.camera_rgb)
+    if img is None:
+        return None
+    arr = np.frombuffer(img, np.uint8).reshape((h, w, 4))       # Webots frame is BGRA
+    bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+
+def _get_depth_cm():
+    """Depth range image as an int16 numpy array in centimetres (-1 = invalid)."""
+    data, w, h = _read_depth_image()
+    if data is None:
+        return None
+    depth = np.asarray(data, dtype=np.float32).reshape((h, w)) * 100.0  # m -> cm
+    depth = np.where(np.isinf(depth), -1.0, depth)
+    return depth.astype(np.int16)
+
+
+def _segment_color(hsv, color):
+    """Binary mask (uint8 0/255) of pixels within the HSV band for `color`."""
+    band = _HSV_BANDS.get(color)
+    if band is None or hsv is None:
+        return None
+    lo, hi = band
+    return cv2.inRange(hsv, lo, hi)
+
+
+def _resize_mask_to(mask, shape_hw):
+    """Nearest-neighbour resize a mask to (h, w) so it aligns with the depth grid."""
+    if mask.shape == shape_hw:
+        return mask
+    return cv2.resize(mask, (shape_hw[1], shape_hw[0]), interpolation=cv2.INTER_NEAREST)
+
+
+def _column_fully_in_frame(mask, top_strip=COLUMN_TOP_STRIP_PX):
+    """True if no column pixels touch the top strip (column not clipped at top)."""
+    return int(np.count_nonzero(mask[:top_strip, :])) == 0
+
+
+def _estimate_column_distance_cm(mask, depth_cm):
+    """Horizontal distance (cm) to a colour column from depth + known height.
+
+    Ported from AURE estimate_column_distance: take the far depth over the
+    column mask, correct for a column clipped at the top of frame, then remove
+    the known vertical component (COLUMN_HEIGHT_CM) via Pythagoras.  Returns
+    None when unmeasurable, or a small "close" value when the column fills the
+    frame but depth is invalid (very near — depth saturates on contact).
+    """
+    if mask is None or depth_cm is None or not np.any(mask):
         return None
 
-    # RGB/depth camera resolutions may differ; scale image coordinates.
-    depth_col = min(depth_w - 1, max(0, int(col * depth_w / rgb_w)))
-    depth_row = min(depth_h - 1, max(0, int(row * depth_h / rgb_h)))
-    v = depth_data[depth_row * depth_w + depth_col]
-    return v if _is_valid_range(v, GREEN_DEPTH_MIN_VALID) else None
+    mask_d = _resize_mask_to(mask, depth_cm.shape)
+    depth_values = depth_cm[mask_d != 0]
+    valid = depth_values[depth_values > 0]
 
+    if valid.size == 0:
+        area_ratio = float(np.count_nonzero(mask)) / float(mask.size)
+        return 50.0 if area_ratio > 0.20 else None
 
-def _green_pixel(r, g, b):
-    return g > 80 and g > 1.35 * r and g > 1.25 * b
+    max_depth_cm = float(np.max(valid))
+    if not _column_fully_in_frame(mask):
+        max_depth_cm *= 1.25 if max_depth_cm < 110.0 else 1.1
 
-
-def _blue_pixel(r, g, b):
-    return (
-        b > 60 and            # ✅ lower threshold
-        b > 1.2 * r and      # blue dominates red
-        b > 1.2 * g          # blue dominates green
-    )
-
-
-def _yellow_pixel(r, g, b):
-    return (
-            r > 140 and
-            g > 140 and
-            b < 100 and                  # ✅ strong blue suppression
-            abs(r - g) < 25 and          # ✅ VERY tight equality
-            (r + g) > (2 * b + 100)      # ✅ strong dominance
-        )
-
-
-
-
-
-def _green_ground_roi(w, h):
-    # Bottom-center ROI: the next ground patch likely to pass under the robot.
-    return int(0.20 * w), int(0.80 * w), int(0.62 * h), int(0.95 * h)
-
-
-def _target_roi(w, h):
-    # Central ROI: forward objects/pillars without ground-dominated bottom rows.
-    return int(0.20 * w), int(0.80 * w), int(0.12 * h), int(0.72 * h)
-
-
-def _sample_color_ratio(img, w, h, roi, predicate,
-                        depth_data=None, depth_w=0, depth_h=0):
-    col0, col1, row0, row1 = roi
-    total   = 0
-    hits    = 0
-    col_sum = 0
-    row_sum = 0
-    depths  = []
-
-    for row in range(row0, row1, 3):
-        for col in range(col0, col1, 3):
-            r, g, b = _rgb_at(img, w, row, col)
-            total += 1
-            if not predicate(r, g, b):
-                continue
-
-            hits += 1
-            col_sum += col
-            row_sum += row
-            depth = _depth_at_rgb_pixel(depth_data, depth_w, depth_h, w, h, row, col)
-            if depth is not None:
-                depths.append(depth)
-
-    ratio    = hits / total if total else 0.0
-    centroid = (col_sum / hits, row_sum / hits) if hits else None
-    return ratio, depths, centroid
+    if max_depth_cm <= COLUMN_HEIGHT_CM:
+        return float(np.mean(valid))   # too close for the height correction
+    horizontal = math.sqrt(max_depth_cm ** 2 - COLUMN_HEIGHT_CM ** 2)
+    return horizontal + COLUMN_DIST_OFFSET_CM
 
 
 def _pixel_to_bearing(col, w, fov):
@@ -211,6 +217,20 @@ def read_imu_yaw():
     return yaw if math.isfinite(yaw) else None
 
 
+def read_gyro_z():
+    """Return the IMU gyro yaw rate (rad/s about +z), or None if unavailable.
+
+    Element [2] is the z-axis (yaw) angular rate in the robot's Z-up frame.
+    Unlike wheel encoders, the gyro measures true inertial body rotation, so
+    wheel slip cannot fake it — this feeds the localization slip gate.
+    """
+    vals = _read_vector(devices.gyro, "getValues")
+    if vals is None:
+        return None
+    gz = vals[2]
+    return gz if math.isfinite(gz) else None
+
+
 def read_laser_scan():
     """Return (ranges, fov_rad, max_range_m) for the laser, or (None, None, None).
 
@@ -230,6 +250,72 @@ def read_laser_scan():
     if not ranges or fov is None or max_range is None:
         return None, None, None
     return ranges, fov, max_range
+
+
+def green_ground_points_body():
+    """Project detected green-ground pixels onto the floor plane.
+
+    Returns Nx2 body-frame points [x_forward, y_left] (metres) via an inverse
+    pinhole model (camera intrinsics from FOV + mounting height).  Only the
+    lower image is trusted (ground), and points are subsampled for cost.
+    Empty (0, 2) array when no green is visible or the camera is unavailable.
+    """
+    empty = np.empty((0, 2), dtype=np.float64)
+    hsv = _get_hsv_image()
+    if hsv is None or _rgb_fov is None:
+        return empty
+    mask = _segment_color(hsv, "green")
+    if mask is None:
+        return empty
+    h, w = mask.shape
+    mask[:int(GREEN_ROI_TOP_FRAC * h), :] = 0     # trust only the lower image (floor)
+    vs, us = np.where(mask == 255)                # rows (v), cols (u)
+    if us.size == 0:
+        return empty
+    if us.size > 400:                             # subsample dense masks
+        idx = np.linspace(0, us.size - 1, 400).astype(int)
+        us, vs = us[idx], vs[idx]
+
+    fx = w / (2.0 * math.tan(_rgb_fov / 2.0))
+    cx, cy = w / 2.0, h / 2.0
+    x_norm = (us - cx) / fx
+    y_norm = (vs - cy) / fx                        # square pixels: fy == fx
+
+    # Forward distance on the floor: D = camera_height / y_norm (y_norm below horizon).
+    D = GREEN_CAM_HEIGHT_M / (y_norm + 1e-6)
+    valid = (y_norm > 0.001) & (D > 0.1) & (D < GREEN_MAX_PROJ_DIST)
+    D, x_norm = D[valid], x_norm[valid]
+    if D.size == 0:
+        return empty
+
+    bx = D + GREEN_CAM_X_OFFSET                     # forward
+    by = -D * x_norm                                # left (+) / right (-)
+    return np.stack([bx, by], axis=1)
+
+
+def read_lidar_pointcloud_2d():
+    """Return Nx2 lidar points [x_forward, y_left] in the robot body frame.
+
+    Reads the laser point cloud (requires laser.enablePointCloud(), done in
+    devices.py), drops non-finite points, and returns an (N, 2) float array.
+    Returns an empty (0, 2) array when the lidar is unavailable or the cloud
+    is empty.  This is the map layer's sole lidar input.
+    """
+    laser = devices.laser
+    empty = np.empty((0, 2), dtype=np.float64)
+    if laser is None:
+        return empty
+    try:
+        cloud = laser.getPointCloud()
+    except Exception:
+        return empty
+    if not cloud:
+        return empty
+    pts = np.array([[p.x, p.y] for p in cloud], dtype=np.float64)
+    if pts.size == 0:
+        return empty
+    finite = ~np.isinf(pts).any(axis=1) & ~np.isnan(pts).any(axis=1)
+    return pts[finite]
 
 
 def _read_vector(sensor, method):
@@ -385,11 +471,12 @@ def get_front_laser_min():
 
 
 def read_color_detections():
-    """Detect semantic colors from the RGB camera.
+    """Detect blue/yellow columns and green ground via HSV segmentation.
 
-    Returns ratios for green ground in the lower image and blue/yellow pillars in
-    the central image. Green distance is estimated by reading depth pixels that
-    correspond to green RGB pixels.
+    AURE's cv2 approach: blue/yellow report a bearing (from the mask centroid)
+    and a depth+height distance estimate; green reports a lower-image ratio and
+    a depth-sampled distance.  The return schema is kept stable for the reactive
+    stack (autonomous.py, the P key) — this swaps only the detection engine.
     """
     result = {
         "green":  False, "green_ratio":  0.0, "green_distance": INF,
@@ -399,64 +486,47 @@ def read_color_detections():
         "yellow_bearing_rad": None, "yellow_distance_m": INF,
     }
 
-    img, w, h = _read_camera_image(devices.camera_rgb)
-    if img is None:
+    hsv = _get_hsv_image()
+    if hsv is None:
         return result
+    h, w = hsv.shape[:2]
+    depth_cm = _get_depth_cm()
 
-    depth_data, depth_w, depth_h = _read_depth_image()
+    # ── Green ground: trusted only in the lower image ─────────────────────────
+    green_mask = _segment_color(hsv, "green")
+    if green_mask is not None:
+        top = int(GREEN_ROI_TOP_FRAC * h)
+        green_mask[:top, :] = 0
+        roi_area = w * (h - top)
+        green_ratio = int(cv2.countNonZero(green_mask)) / float(roi_area) if roi_area > 0 else 0.0
+        result["green_ratio"] = green_ratio
+        result["green"] = green_ratio >= GREEN_PIXEL_RATIO
+        if result["green"] and depth_cm is not None:
+            gm = _resize_mask_to(green_mask, depth_cm.shape)
+            gd = depth_cm[gm != 0]
+            gd = gd[gd > 0]
+            if gd.size:
+                result["green_distance"] = float(np.min(gd)) / 100.0   # cm -> m
 
-    # ✅ Keep depths from sampling
-    green_ratio, green_depths, _ = _sample_color_ratio(
-        img, w, h,
-        _green_ground_roi(w, h), _green_pixel,
-        depth_data, depth_w, depth_h
-    )
+    # ── Blue / yellow columns ─────────────────────────────────────────────────
+    for color in ("blue", "yellow"):
+        mask = _segment_color(hsv, color)
+        if mask is None:
+            continue
+        ratio = int(cv2.countNonZero(mask)) / float(w * h)
+        result[f"{color}_ratio"] = ratio
+        if ratio < TARGET_PIXEL_RATIO:
+            continue
+        result[color] = True
 
-    blue_ratio, blue_depths, blue_centroid = _sample_color_ratio(
-        img, w, h,
-        _target_roi(w, h), _blue_pixel,
-        depth_data, depth_w, depth_h
-    )
+        moments = cv2.moments(mask)
+        if moments["m00"] > 0:
+            centroid_col = moments["m10"] / moments["m00"]
+            result[f"{color}_bearing_rad"] = _pixel_to_bearing(centroid_col, w, _rgb_fov)
 
-    yellow_ratio, yellow_depths, yellow_centroid = _sample_color_ratio(
-        img, w, h,
-        _target_roi(w, h), _yellow_pixel,
-        depth_data, depth_w, depth_h
-    )
-
-    # ✅ Store ratios
-    result["green_ratio"]  = green_ratio
-    result["blue_ratio"]   = blue_ratio
-    result["yellow_ratio"] = yellow_ratio
-
-    # ✅ Green distance (already correct)
-    if green_depths:
-        result["green_distance"] = _percentile(green_depths, 10)
-
-    # ✅ Detection flags
-    result["green"]  = green_ratio  >= GREEN_PIXEL_RATIO
-    result["blue"]   = blue_ratio   >= TARGET_PIXEL_RATIO
-    result["yellow"] = yellow_ratio >= TARGET_PIXEL_RATIO
-
-    # ✅ BLUE processing (FINAL CORRECT)
-    if result["blue"] and blue_centroid is not None:
-        bcol, brow = int(blue_centroid[0]), int(blue_centroid[1])
-
-        result["blue_bearing_rad"] = _pixel_to_bearing(bcol, w, _rgb_fov)
-
-        # ✅ Use robust region-based depth
-        if blue_depths:
-            result["blue_distance_m"] = min(blue_depths)
-
-    # ✅ YELLOW processing (FINAL CORRECT)
-    if result["yellow"] and yellow_centroid is not None:
-        ycol, yrow = int(yellow_centroid[0]), int(yellow_centroid[1])
-
-        result["yellow_bearing_rad"] = _pixel_to_bearing(ycol, w, _rgb_fov)
-
-        # ✅ Use robust region-based depth
-        if yellow_depths:
-            result["yellow_distance_m"] = min(yellow_depths)
+        dist_cm = _estimate_column_distance_cm(mask, depth_cm)
+        if dist_cm is not None:
+            result[f"{color}_distance_m"] = dist_cm / 100.0   # cm -> m
 
     return result
 
