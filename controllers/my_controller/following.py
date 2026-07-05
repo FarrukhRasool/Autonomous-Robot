@@ -163,7 +163,9 @@ def step(pose, dt):
     if _map_dist(robot_cell, _path[-1]) < PATH_FOLLOWING_TARGET_REACH_DIST_PX:
         return 0.0, 0.0, "done"
 
-    # Advance the active waypoint past any already-reached ones.
+    # AURE follower: lock onto a FIXED waypoint until it is reached, then step
+    # ahead by the stride.  A stable target (not re-picked every tick) is what
+    # lets DWA drive straight at the path instead of hunting a moving carrot.
     while (_target_index < len(_path) - 1
            and _map_dist(robot_cell, _path[_target_index]) < PATH_FOLLOWING_TARGET_REACH_DIST_PX):
         _target_index += FOLLOW_WAYPOINT_STRIDE
