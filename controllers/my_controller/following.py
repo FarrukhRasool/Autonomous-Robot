@@ -21,7 +21,9 @@ from config import (
     DWA_VELOCITY_SAMPLES, DWA_ANGULAR_SAMPLES, DWA_ROLLOUT_STEPS, DWA_ROBOT_RADIUS_PX,
     DWA_HEADING_WEIGHT, DWA_DISTANCE_WEIGHT, DWA_SPEED_WEIGHT, DWA_CLEARANCE_WEIGHT,
     PATH_FOLLOWING_TARGET_REACH_DIST_PX, FOLLOW_WAYPOINT_STRIDE,
-    FOLLOW_STUCK_MOVE_M, FOLLOW_STUCK_TURN_RAD, FOLLOW_STUCK_STEPS,
+    FOLLOW_RECOVER_STEPS, FOLLOW_RECOVER_VEL, FOLLOW_RECOVER_OMEGA, FOLLOW_MAX_RECOVERS,
+    FOLLOW_PROGRESS_WIN, FOLLOW_MIN_PROGRESS_M,
+    REAR_SAFE_DIST,
 )
 
 # Forward-speed cap used to normalise the DWA speed reward (m/s).
@@ -30,8 +32,10 @@ _MAX_SPEED = MAX_WHEEL_SPEED_RAD_S * WHEEL_RADIUS_M
 # ── Follower state ────────────────────────────────────────────────────────────
 _path = None
 _target_index = 0
-_stuck_last_pos = None
-_stuck_count = 0
+_recover_ticks = 0    # >0 while backing out of a wall the path runs into
+_recover_count = 0    # no-progress windows so far (escalates to "stuck" -> replan)
+_prog_ref = None      # robot (x, y) at the start of the current progress window
+_prog_ticks = 0       # ticks elapsed in the current progress window
 
 
 def _wrap(a):
@@ -119,22 +123,39 @@ def dwa_velocity(pose, world_target, dt):
 
 # ── Step-wise path follower ───────────────────────────────────────────────────
 
+def _reset_recovery():
+    global _recover_ticks, _recover_count, _prog_ref, _prog_ticks
+    _recover_ticks = 0
+    _recover_count = 0
+    _prog_ref = None
+    _prog_ticks = 0
+
+
 def set_path(path):
     """Load a path (list of (x, y) map cells) and reset follow state."""
-    global _path, _target_index, _stuck_last_pos, _stuck_count
+    global _path, _target_index
     _path = list(path) if path else None
     _target_index = min(FOLLOW_WAYPOINT_STRIDE, len(_path) - 1) if _path else 0
-    _stuck_last_pos = None
-    _stuck_count = 0
+    _reset_recovery()
 
 
 def reset():
     """Clear the follower state (no active path)."""
-    global _path, _target_index, _stuck_last_pos, _stuck_count
+    global _path, _target_index
     _path = None
     _target_index = 0
-    _stuck_last_pos = None
-    _stuck_count = 0
+    _reset_recovery()
+
+
+def _rear_clear(pose):
+    """True if the map shows no obstacle just behind the robot (safe to reverse)."""
+    x, y, theta = pose
+    for d in (0.06, 0.12, 0.18):
+        bx = x - d * math.cos(theta)
+        by = y - d * math.sin(theta)
+        if mapping.there_is_obstacle(mapping.world_to_map(bx, by)):
+            return False
+    return True
 
 
 def has_path():
@@ -149,9 +170,9 @@ def current_path():
 def step(pose, dt):
     """Advance one control tick.  Returns (v, omega, status).
 
-    status is one of: "following", "done", "stuck", "idle".
+    status is one of: "following", "recovering", "done", "stuck", "idle".
     """
-    global _target_index, _stuck_last_pos, _stuck_count
+    global _target_index, _recover_ticks, _recover_count, _prog_ref, _prog_ticks
 
     if not _path:
         return 0.0, 0.0, "idle"
@@ -163,6 +184,32 @@ def step(pose, dt):
     if _map_dist(robot_cell, _path[-1]) < PATH_FOLLOWING_TARGET_REACH_DIST_PX:
         return 0.0, 0.0, "done"
 
+    # ── Progress watchdog: measure NET movement over a window ──────────────────
+    # Catches limit cycles (creep-forward / back-out oscillation in a pocket)
+    # that never fully box DWA.  On real progress, clear the recovery counter;
+    # on a stalled window, back out — and after a few, give up so we replan.
+    if _prog_ref is None:
+        _prog_ref = (x, y)
+    _prog_ticks += 1
+    if _prog_ticks >= FOLLOW_PROGRESS_WIN:
+        moved = math.hypot(x - _prog_ref[0], y - _prog_ref[1])
+        _prog_ref = (x, y)
+        _prog_ticks = 0
+        if moved >= FOLLOW_MIN_PROGRESS_M:
+            _recover_count = 0
+        else:
+            _recover_count += 1
+            if _recover_count > FOLLOW_MAX_RECOVERS:
+                return 0.0, 0.0, "stuck"          # give up -> caller replans
+            _recover_ticks = FOLLOW_RECOVER_STEPS  # back out decisively and retry
+
+    # Recovery maneuver in progress: back out (arc reverse if rear clear) + turn.
+    if _recover_ticks > 0:
+        _recover_ticks -= 1
+        if _rear_clear(pose):
+            return FOLLOW_RECOVER_VEL, FOLLOW_RECOVER_OMEGA, "recovering"
+        return 0.0, FOLLOW_RECOVER_OMEGA, "recovering"
+
     # AURE follower: lock onto a FIXED waypoint until it is reached, then step
     # ahead by the stride.  A stable target (not re-picked every tick) is what
     # lets DWA drive straight at the path instead of hunting a moving carrot.
@@ -171,21 +218,13 @@ def step(pose, dt):
         _target_index += FOLLOW_WAYPOINT_STRIDE
     _target_index = min(_target_index, len(_path) - 1)
 
-    # Stuck detection: no meaningful progress for N ticks.  Rotating in place
-    # counts as progress (the robot is actively turning to escape / re-aim),
-    # so a long turn isn't mistaken for being stuck.
-    if _stuck_last_pos is not None:
-        moved = math.hypot(x - _stuck_last_pos[0], y - _stuck_last_pos[1])
-        turned = abs(_wrap(theta - _stuck_last_pos[2]))
-        if moved < FOLLOW_STUCK_MOVE_M and turned < FOLLOW_STUCK_TURN_RAD:
-            _stuck_count += 1
-            if _stuck_count >= FOLLOW_STUCK_STEPS:
-                return 0.0, 0.0, "stuck"
-        else:
-            _stuck_count = 0
-    _stuck_last_pos = (x, y, theta)
-
     target = _path[_target_index]
     world_target = mapping.map_to_world(target[0], target[1])
     v, w = dwa_velocity(pose, world_target, dt)
+
+    # DWA boxed (v=w=0): target behind a wall discovered after planning -> back out.
+    if abs(v) < 1e-3 and abs(w) < 1e-3:
+        _recover_ticks = FOLLOW_RECOVER_STEPS
+        return (FOLLOW_RECOVER_VEL if _rear_clear(pose) else 0.0), FOLLOW_RECOVER_OMEGA, "recovering"
+
     return v, w, "following"
