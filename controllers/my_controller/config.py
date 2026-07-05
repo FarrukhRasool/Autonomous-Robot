@@ -89,6 +89,7 @@ LOGODDS_FREE = -0.36  # added to cells the ray passes through (free evidence)
 LOGODDS_OCC  = 0.85   # added to the ray's endpoint cell (hit evidence)
 LOGODDS_LOCK = 3.5    # cells at/above this are frozen (sticky walls); free updates skip them
 LOGODDS_CLIP = 5.0    # clamp log-odds to +/- this before the sigmoid
+MAP_LIDAR_MAX_RANGE_M = 3.5  # ignore lidar points beyond this (far rays smear the map)
 
 # Discrete grid thresholds (P = sigmoid(log_odds)):
 P_OCC  = 0.7  # P above this -> OBSTACLE
@@ -107,7 +108,8 @@ MAP_UPDATE_MAX_OMEGA    = 5.0   # rad/s — only skip mapping during very fast s
                                 # (DWA turns up to ~2.5 rad/s must still map, or it drives blind)
 
 # ── Path planning (AURE A* + clearance + spline) ──────────────────────────────
-ASTAR_INFLATION_LEVELS = [4, 3, 2]  # px — escalating obstacle inflation (safest first)
+ASTAR_INFLATION_LEVELS = [4, 3]     # px — min (3) must stay > DWA_ROBOT_RADIUS_PX so DWA can
+                                    # follow its own paths (else it rejects them and "sticks")
 ASTAR_EXPANSION_PIXELS = 3          # px — free-disk radius around start/goal endpoints
 PATH_MIN_LENGTH_M      = 0.8        # m — shorter A* results are retried at thinner inflation
 ASTAR_SAFE_DISTANCE_PX = 5.0        # px — clearance band within which the wall penalty applies
@@ -118,14 +120,15 @@ ASTAR_HEURISTIC_WEIGHT = 1.2        # A* heuristic multiplier (matches AURE)
 DWA_VELOCITY_SAMPLES = [0.0, 0.1, 0.2, 0.3]   # m/s; 0.0 lets DWA rotate in place to escape
 DWA_ANGULAR_SAMPLES  = [0.0, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 2.5, -2.5]  # rad/s (gentler)
 DWA_ROLLOUT_STEPS    = 15    # forward-prediction horizon (control steps)
-DWA_ROBOT_RADIUS_PX  = 3     # px — true robot half-width; keeps the body clear so it can't wedge
+DWA_ROBOT_RADIUS_PX  = 2     # px — body clearance; MUST stay < min(ASTAR_INFLATION_LEVELS)
+                             # so DWA can drive its own (inflation-3) planned paths
 DWA_HEADING_WEIGHT   = 4.0   # reward facing the target
 DWA_DISTANCE_WEIGHT  = 3.5   # reward closing distance to the target
 DWA_SPEED_WEIGHT     = 0.5   # reward higher speed
 DWA_CLEARANCE_WEIGHT = 2.0   # reward staying away from obstacles
 
 PATH_FOLLOWING_TARGET_REACH_DIST_PX = 4   # px — waypoint considered reached within this
-FOLLOW_WAYPOINT_STRIDE = 5                # advance this many path cells per waypoint
+FOLLOW_WAYPOINT_STRIDE = 5                # step ahead this many waypoints once one is reached (AURE)
 FOLLOW_STUCK_MOVE_M = 0.005               # m/tick below which progress counts as stalled
 FOLLOW_STUCK_TURN_RAD = 0.03              # rad/tick — rotating this much still counts as progress
 FOLLOW_STUCK_STEPS  = 25                  # stalled ticks before declaring "stuck"
@@ -134,6 +137,7 @@ FOLLOW_STUCK_STEPS  = 25                  # stalled ticks before declaring "stuc
 # over a window, the path is stale (a wall was discovered on it) -> replan.
 FOLLOW_PROGRESS_WINDOW = 40   # control ticks between progress checks
 FOLLOW_MIN_PROGRESS_PX = 3    # min cells closer to goal per window, else replan
+FOLLOW_MAX_RETRIES = 6        # replans allowed on stuck in manual Follow (Y) before giving up
 
 # ── Frontier exploration (AURE) ───────────────────────────────────────────────
 FRONTIER_MIN_CLUSTER       = 15   # min frontier cells to keep a cluster
