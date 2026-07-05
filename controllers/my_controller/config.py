@@ -115,6 +115,8 @@ PATH_MIN_LENGTH_M      = 0.8        # m — shorter A* results are retried at th
 ASTAR_SAFE_DISTANCE_PX = 5.0        # px — clearance band within which the wall penalty applies
 ASTAR_PENALTY_STRENGTH = 2.0        # cost weight pushing paths away from walls
 ASTAR_HEURISTIC_WEIGHT = 1.2        # A* heuristic multiplier (matches AURE)
+PLAN_BLOCK_UNKNOWN     = True       # only route through mapped-free space (never through
+                                    # UNKNOWN) — paths can't run into unmapped walls
 
 # ── DWA local path follower (AURE) ────────────────────────────────────────────
 DWA_VELOCITY_SAMPLES = [0.0, 0.1, 0.2, 0.3]   # m/s; 0.0 lets DWA rotate in place to escape
@@ -138,6 +140,16 @@ FOLLOW_STUCK_STEPS  = 25                  # stalled ticks before declaring "stuc
 FOLLOW_PROGRESS_WINDOW = 40   # control ticks between progress checks
 FOLLOW_MIN_PROGRESS_PX = 3    # min cells closer to goal per window, else replan
 FOLLOW_MAX_RETRIES = 6        # replans allowed on stuck in manual Follow (Y) before giving up
+
+# When DWA is boxed (target behind a newly-seen wall) or the robot stalls in a
+# pocket (no net progress), back out and turn to escape; after a few failed
+# windows report "stuck" so the caller replans.  Self-contained in following.py.
+FOLLOW_RECOVER_STEPS  = 25    # ticks spent backing out + turning
+FOLLOW_RECOVER_VEL    = -0.12 # m/s reverse speed during recovery
+FOLLOW_RECOVER_OMEGA  = 1.2   # rad/s turn while reversing (arc out, re-orient)
+FOLLOW_MAX_RECOVERS   = 3     # no-progress windows before reporting "stuck" (-> replan)
+FOLLOW_PROGRESS_WIN   = 35    # ticks over which net movement is checked
+FOLLOW_MIN_PROGRESS_M = 0.12  # min net metres moved per window, else it's stalled
 
 # ── Frontier exploration (AURE) ───────────────────────────────────────────────
 FRONTIER_MIN_CLUSTER       = 15   # min frontier cells to keep a cluster

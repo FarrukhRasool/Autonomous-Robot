@@ -22,9 +22,10 @@ from scipy.interpolate import splprep, splev
 
 import mapping
 from config import (
-    CELL_FREE, CELL_OCC, CELL_CLOSED, CELL_GREEN,
+    CELL_FREE, CELL_OCC, CELL_CLOSED, CELL_GREEN, CELL_UNKNOWN,
     ASTAR_INFLATION_LEVELS, ASTAR_EXPANSION_PIXELS, PATH_MIN_LENGTH_M,
     ASTAR_SAFE_DISTANCE_PX, ASTAR_PENALTY_STRENGTH, ASTAR_HEURISTIC_WEIGHT,
+    PLAN_BLOCK_UNKNOWN,
 )
 
 
@@ -200,6 +201,7 @@ def plan(start_cell, goal_cell, grid=None):
         work = base.astype(np.int32)
         closed_mask = (work == CELL_CLOSED)
         green_mask = (work == CELL_GREEN)
+        unknown_mask = (work == CELL_UNKNOWN)
 
         # Don't inflate closures/green: closures free during inflation, green hard.
         work[closed_mask] = CELL_FREE
@@ -212,6 +214,11 @@ def plan(start_cell, goal_cell, grid=None):
         # Re-apply closures/green as hard obstacles after inflation.
         work[closed_mask] = CELL_OCC
         work[green_mask] = CELL_OCC
+
+        # Only route through mapped-free space: block UNKNOWN so a path can never
+        # run into an unmapped wall (endpoint disks below still free start/goal).
+        if PLAN_BLOCK_UNKNOWN:
+            work[unknown_mask] = CELL_OCC
 
         _expand_free_disk(work, goal_cell, ASTAR_EXPANSION_PIXELS)
         _expand_free_disk(work, start_cell, ASTAR_EXPANSION_PIXELS)
