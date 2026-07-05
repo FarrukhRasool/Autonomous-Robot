@@ -18,6 +18,7 @@ from config import (
     GREEN_HSV_LOWER, GREEN_HSV_UPPER,
     COLUMN_HEIGHT_CM, COLUMN_DIST_OFFSET_CM, COLUMN_TOP_STRIP_PX,
     GREEN_CAM_HEIGHT_M, GREEN_CAM_X_OFFSET, GREEN_MAX_PROJ_DIST, GREEN_MARK_MIN_PIXELS,
+    MAP_LIDAR_MAX_RANGE_M,
 )
 
 
@@ -315,7 +316,12 @@ def read_lidar_pointcloud_2d():
     if pts.size == 0:
         return empty
     finite = ~np.isinf(pts).any(axis=1) & ~np.isnan(pts).any(axis=1)
-    return pts[finite]
+    pts = pts[finite]
+    if pts.shape[0] == 0:
+        return empty
+    # Drop far points (rays escaping through gaps to the outer boundary smear the map).
+    within = np.hypot(pts[:, 0], pts[:, 1]) <= MAP_LIDAR_MAX_RANGE_M
+    return pts[within]
 
 
 def _read_vector(sensor, method):
