@@ -22,7 +22,8 @@ from config import (
     DWA_HEADING_WEIGHT, DWA_DISTANCE_WEIGHT, DWA_SPEED_WEIGHT, DWA_CLEARANCE_WEIGHT,
     PATH_FOLLOWING_TARGET_REACH_DIST_PX, FOLLOW_WAYPOINT_STRIDE,
     FOLLOW_RECOVER_STEPS, FOLLOW_RECOVER_VEL, FOLLOW_RECOVER_OMEGA, FOLLOW_MAX_RECOVERS,
-    FOLLOW_PROGRESS_WIN, FOLLOW_MIN_PROGRESS_M,
+    FOLLOW_PROGRESS_WIN, FOLLOW_MIN_PROGRESS_CELLS,
+    FOLLOW_ALIGN_RAD, FOLLOW_ALIGN_OMEGA,
     REAR_SAFE_DIST,
 )
 
@@ -181,21 +182,21 @@ def step(pose, dt):
     robot_cell = mapping.world_to_map(x, y)
 
     # Reached the final goal?
-    if _map_dist(robot_cell, _path[-1]) < PATH_FOLLOWING_TARGET_REACH_DIST_PX:
+    goal_dist = _map_dist(robot_cell, _path[-1])
+    if goal_dist < PATH_FOLLOWING_TARGET_REACH_DIST_PX:
         return 0.0, 0.0, "done"
 
-    # ── Progress watchdog: measure NET movement over a window ──────────────────
-    # Catches limit cycles (creep-forward / back-out oscillation in a pocket)
-    # that never fully box DWA.  On real progress, clear the recovery counter;
-    # on a stalled window, back out — and after a few, give up so we replan.
+    # ── Progress watchdog: are we getting CLOSER to the goal? ──────────────────
+    # Measuring goal-distance closed (not raw movement) means a legitimate pivot
+    # or curve isn't mistaken for a stall, while a real corner-stall still fires.
     if _prog_ref is None:
-        _prog_ref = (x, y)
+        _prog_ref = goal_dist
     _prog_ticks += 1
     if _prog_ticks >= FOLLOW_PROGRESS_WIN:
-        moved = math.hypot(x - _prog_ref[0], y - _prog_ref[1])
-        _prog_ref = (x, y)
+        closed = _prog_ref - goal_dist
+        _prog_ref = goal_dist
         _prog_ticks = 0
-        if moved >= FOLLOW_MIN_PROGRESS_M:
+        if closed >= FOLLOW_MIN_PROGRESS_CELLS:
             _recover_count = 0
         else:
             _recover_count += 1
@@ -220,6 +221,13 @@ def step(pose, dt):
 
     target = _path[_target_index]
     world_target = mapping.map_to_world(target[0], target[1])
+
+    # Sharp turn: pivot in place to face the target first, so we turn the corner
+    # cleanly instead of arcing into its inside wall.
+    heading_err = _wrap(math.atan2(world_target[1] - y, world_target[0] - x) - theta)
+    if abs(heading_err) > FOLLOW_ALIGN_RAD:
+        return 0.0, math.copysign(FOLLOW_ALIGN_OMEGA, heading_err), "aligning"
+
     v, w = dwa_velocity(pose, world_target, dt)
 
     # DWA boxed (v=w=0): target behind a wall discovered after planning -> back out.
