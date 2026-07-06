@@ -148,8 +148,13 @@ FOLLOW_RECOVER_STEPS  = 25    # ticks spent backing out + turning
 FOLLOW_RECOVER_VEL    = -0.12 # m/s reverse speed during recovery
 FOLLOW_RECOVER_OMEGA  = 1.2   # rad/s turn while reversing (arc out, re-orient)
 FOLLOW_MAX_RECOVERS   = 3     # no-progress windows before reporting "stuck" (-> replan)
-FOLLOW_PROGRESS_WIN   = 35    # ticks over which net movement is checked
-FOLLOW_MIN_PROGRESS_M = 0.12  # min net metres moved per window, else it's stalled
+FOLLOW_PROGRESS_WIN   = 45    # ticks over which progress TOWARD THE GOAL is checked
+FOLLOW_MIN_PROGRESS_CELLS = 2 # min cells closer to the goal per window, else it's stalled
+
+# Pivot in place to face the next waypoint before driving, so sharp corners are
+# turned cleanly instead of arced into the inside wall.
+FOLLOW_ALIGN_RAD   = 0.7      # rad — align first when the target is beyond this heading error
+FOLLOW_ALIGN_OMEGA = 2.5      # rad/s — pivot rate while aligning
 
 # ── Frontier exploration (AURE) ───────────────────────────────────────────────
 FRONTIER_MIN_CLUSTER       = 15   # min frontier cells to keep a cluster
