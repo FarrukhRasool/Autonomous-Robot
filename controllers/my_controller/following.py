@@ -15,15 +15,20 @@ Conventions: pose is (x_m, y_m, theta_rad) world frame; paths are lists of
 
 import math
 
+import numpy as np
+import cv2
+
 import mapping
 from kinematics import WHEEL_RADIUS_M, MAX_WHEEL_SPEED_RAD_S
 from config import (
     DWA_VELOCITY_SAMPLES, DWA_ANGULAR_SAMPLES, DWA_ROLLOUT_STEPS,
     DWA_HEADING_WEIGHT, DWA_DISTANCE_WEIGHT, DWA_SPEED_WEIGHT, DWA_CLEARANCE_WEIGHT,
+    DWA_ROBOT_CLEAR_PX, DWA_CLEAR_PENALTY,
     PATH_FOLLOWING_TARGET_REACH_DIST_PX, FOLLOW_WAYPOINT_STRIDE,
     FOLLOW_RECOVER_STEPS, FOLLOW_RECOVER_VEL, FOLLOW_RECOVER_OMEGA, FOLLOW_MAX_RECOVERS,
     FOLLOW_PROGRESS_WIN, FOLLOW_MIN_PROGRESS_CELLS,
     REAR_SAFE_DIST,
+    CELL_OCC, CELL_GREEN, CELL_CLOSED, CELL_BLUE, CELL_YELLOW,
 )
 
 # Forward-speed cap used to normalise the DWA speed reward (m/s).
@@ -46,14 +51,39 @@ def _map_dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def _obstacle_distance_field():
+    """Euclidean distance (in cells) from every cell to the nearest KNOWN obstacle
+    (wall / green / pillar / closed).  UNKNOWN is treated as free, so the follower
+    still enters unmapped space during exploration and only keeps clearance from
+    things actually on the map.  cv2.distanceTransform is C (releases the GIL): one
+    cheap pass per DWA call, and O(1) clearance lookups replace the old per-rollout
+    5x5 Python scan."""
+    grid = mapping.get_grid()
+    obstacle = ((grid == CELL_OCC) | (grid == CELL_GREEN) | (grid == CELL_CLOSED)
+                | (grid == CELL_BLUE) | (grid == CELL_YELLOW))
+    free_src = np.where(obstacle, 0, 255).astype(np.uint8)
+    return cv2.distanceTransform(free_src, cv2.DIST_L2, 3)
+
+
 def dwa_velocity(pose, world_target, dt):
     """AURE Dynamic Window: pick the (v, omega) that best drives toward
-    world_target while its short forward rollout stays clear of mapped
-    obstacles.  Score = heading + distance-progress + speed + clearance.
+    world_target while its short forward rollout stays clear of mapped obstacles.
+    Score = heading + distance-progress + speed + clearance - body-clip penalty.
+
+    Body-aware anti-clip: DWA scores the trajectory CENTRELINE, so a route whose
+    centre only skims a wall lets the robot's body clip corridor corners.  Every
+    rollout cell's clearance is read from a distance field; a rollout that comes
+    within the robot's half-width (DWA_ROBOT_CLEAR_PX) of a known wall is penalised
+    (steeper the closer it gets).  It's a SOFT penalty, not a reject: when every
+    option is tight the least-bad one still wins, so a narrow corridor yields a
+    careful move instead of a stuck refusal.
     """
     x, y, theta = pose
     tx, ty = world_target
     current_distance = math.hypot(tx - x, ty - y)
+
+    dist_field = _obstacle_distance_field()
+    map_h, map_w = dist_field.shape
 
     best_score = -float("inf")
     best_v = 0.0
@@ -64,6 +94,7 @@ def dwa_velocity(pose, world_target, dt):
             cx, cy, ct = x, y, theta
             good = True
             min_clear = float("inf")
+            end_clear = float("inf")   # clearance at the LAST rollout cell (steering signal)
 
             # Pure in-place rotation (v == 0) never translates the robot into a
             # wall, so it is always allowed.  (The reference DWA samples never
@@ -79,23 +110,18 @@ def dwa_velocity(pose, world_target, dt):
                     continue
                 mx, my = mapping.world_to_map(cx, cy)
 
-                # Hard reject only on a DIRECT collision (rollout center enters an
-                # obstacle cell).  Nearness is handled softly by clearance_score
-                # below — matching the reference DWA, which relies on the inflated
-                # planned path for body clearance rather than a hard radius reject.
-                if mapping.there_is_obstacle((mx, my)):
+                # Off the map, or centre inside an obstacle cell (clearance 0):
+                # hard reject — the robot must stay on the bounded, mapped area.
+                if not (0 <= mx < map_w and 0 <= my < map_h):
                     good = False
                     break
-
-                # Nearest obstacle in a 5x5 neighbourhood (Manhattan), for the
-                # soft clearance reward.
-                local_min = float("inf")
-                for dx in range(-2, 3):
-                    for dy in range(-2, 3):
-                        if mapping.there_is_obstacle((mx + dx, my + dy)):
-                            local_min = min(local_min, abs(dx) + abs(dy))
-                if local_min < min_clear:
-                    min_clear = local_min
+                clear_px = float(dist_field[my, mx])
+                if clear_px < 1.0:
+                    good = False
+                    break
+                if clear_px < min_clear:
+                    min_clear = clear_px
+                end_clear = clear_px    # overwritten each step -> holds the final cell's clearance
 
             if not good:
                 continue
@@ -111,6 +137,17 @@ def dwa_velocity(pose, world_target, dt):
                      + DWA_DISTANCE_WEIGHT * distance_score
                      + DWA_SPEED_WEIGHT * speed_score
                      + DWA_CLEARANCE_WEIGHT * clearance_score)
+
+            # Body-clip penalty on the ENDPOINT clearance (not the rollout min).
+            # The first rollout step is always at the robot's current position, so
+            # a min-over-rollout penalty is pinned by where the robot already is
+            # and is identical for every w -> no steering gradient.  The endpoint
+            # clearance DOES differ by steering direction (turning away from a wall
+            # ends further from it), so penalising it makes DWA prefer the
+            # trajectory that curves back toward corridor centre.  Soft, not a
+            # reject: in a uniformly tight corridor the least-bad move still wins.
+            if end_clear != float("inf") and end_clear < DWA_ROBOT_CLEAR_PX:
+                score -= DWA_CLEAR_PENALTY * (DWA_ROBOT_CLEAR_PX - end_clear)
 
             if score > best_score:
                 best_score = score
