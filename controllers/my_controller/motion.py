@@ -37,3 +37,12 @@ def drive_twist(v, omega):
 
 def stop_robot():
     set_wheel_speeds(0.0, 0.0)
+
+
+def is_turning():
+    """True if the wheels are commanded to turn (left/right target speeds differ).
+
+    Ported from the reference is_turning (threshold 0.02 rad/s).  Used to skip the
+    SLAM measurement update while turning — rotation smears the per-scan match.
+    """
+    return abs(devices.fl_motor.getVelocity() - devices.fr_motor.getVelocity()) > 0.02

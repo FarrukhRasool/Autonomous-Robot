@@ -18,7 +18,6 @@ from config import (
     GREEN_HSV_LOWER, GREEN_HSV_UPPER,
     COLUMN_HEIGHT_CM, COLUMN_DIST_OFFSET_CM, COLUMN_TOP_STRIP_PX,
     GREEN_CAM_HEIGHT_M, GREEN_CAM_X_OFFSET, GREEN_MAX_PROJ_DIST, GREEN_MARK_MIN_PIXELS,
-    MAP_LIDAR_MAX_RANGE_M,
 )
 
 
@@ -319,9 +318,10 @@ def read_lidar_pointcloud_2d():
     pts = pts[finite]
     if pts.shape[0] == 0:
         return empty
-    # Drop far points (rays escaping through gaps to the outer boundary smear the map).
-    within = np.hypot(pts[:, 0], pts[:, 1]) <= MAP_LIDAR_MAX_RANGE_M
-    return pts[within]
+    # Full-range point cloud (matches the reference get_pointcloud_2d): SLAM's
+    # scan-matcher uses long-range returns for stronger pose constraints, and it
+    # downsamples the scan itself — so no distance cap is applied here.
+    return pts
 
 
 def _read_vector(sensor, method):

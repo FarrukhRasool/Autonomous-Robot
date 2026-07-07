@@ -18,12 +18,11 @@ import math
 import mapping
 from kinematics import WHEEL_RADIUS_M, MAX_WHEEL_SPEED_RAD_S
 from config import (
-    DWA_VELOCITY_SAMPLES, DWA_ANGULAR_SAMPLES, DWA_ROLLOUT_STEPS, DWA_ROBOT_RADIUS_PX,
+    DWA_VELOCITY_SAMPLES, DWA_ANGULAR_SAMPLES, DWA_ROLLOUT_STEPS,
     DWA_HEADING_WEIGHT, DWA_DISTANCE_WEIGHT, DWA_SPEED_WEIGHT, DWA_CLEARANCE_WEIGHT,
     PATH_FOLLOWING_TARGET_REACH_DIST_PX, FOLLOW_WAYPOINT_STRIDE,
     FOLLOW_RECOVER_STEPS, FOLLOW_RECOVER_VEL, FOLLOW_RECOVER_OMEGA, FOLLOW_MAX_RECOVERS,
     FOLLOW_PROGRESS_WIN, FOLLOW_MIN_PROGRESS_CELLS,
-    FOLLOW_ALIGN_RAD, FOLLOW_ALIGN_OMEGA,
     REAR_SAFE_DIST,
 )
 
@@ -67,8 +66,9 @@ def dwa_velocity(pose, world_target, dt):
             min_clear = float("inf")
 
             # Pure in-place rotation (v == 0) never translates the robot into a
-            # wall, so it is always allowed — this is the robot's escape hatch
-            # when it is boxed in and every forward trajectory is blocked.
+            # wall, so it is always allowed.  (The reference DWA samples never
+            # include 0, so this is normally a no-op, but it keeps a boxed-in
+            # rotate-to-escape possible if a 0 sample is ever added.)
             translating = v > 1e-3
 
             for _ in range(DWA_ROLLOUT_STEPS):
@@ -79,23 +79,21 @@ def dwa_velocity(pose, world_target, dt):
                     continue
                 mx, my = mapping.world_to_map(cx, cy)
 
-                # Hard reject: rollout enters an obstacle cell.
+                # Hard reject only on a DIRECT collision (rollout center enters an
+                # obstacle cell).  Nearness is handled softly by clearance_score
+                # below — matching the reference DWA, which relies on the inflated
+                # planned path for body clearance rather than a hard radius reject.
                 if mapping.there_is_obstacle((mx, my)):
                     good = False
                     break
 
-                # Nearest obstacle in a 5x5 neighbourhood (Manhattan) — reaches
-                # the 3-cell body radius used for the hard-reject below.
+                # Nearest obstacle in a 5x5 neighbourhood (Manhattan), for the
+                # soft clearance reward.
                 local_min = float("inf")
                 for dx in range(-2, 3):
                     for dy in range(-2, 3):
                         if mapping.there_is_obstacle((mx + dx, my + dy)):
                             local_min = min(local_min, abs(dx) + abs(dy))
-
-                # Hard reject: the robot body would clip a wall (keep a radius buffer).
-                if local_min <= DWA_ROBOT_RADIUS_PX:
-                    good = False
-                    break
                 if local_min < min_clear:
                     min_clear = local_min
 
@@ -222,12 +220,9 @@ def step(pose, dt):
     target = _path[_target_index]
     world_target = mapping.map_to_world(target[0], target[1])
 
-    # Sharp turn: pivot in place to face the target first, so we turn the corner
-    # cleanly instead of arcing into its inside wall.
-    heading_err = _wrap(math.atan2(world_target[1] - y, world_target[0] - x) - theta)
-    if abs(heading_err) > FOLLOW_ALIGN_RAD:
-        return 0.0, math.copysign(FOLLOW_ALIGN_OMEGA, heading_err), "aligning"
-
+    # Pure DWA tracking (as in the reference follow_local_target): no in-place
+    # pivot — the wide angular sample set arcs even sharp turns while moving,
+    # which is what keeps the motion smooth.
     v, w = dwa_velocity(pose, world_target, dt)
 
     # DWA boxed (v=w=0): target behind a wall discovered after planning -> back out.
