@@ -128,13 +128,27 @@ ASTAR_FRONTIER_INFLATION = 4        # px — single inflation level for the fron
 # smooth (no jerky in-place spin).  Obstacle safety comes from the inflated
 # planned path + a direct-collision reject + soft clearance scoring (no hard
 # body-radius reject).
-DWA_VELOCITY_SAMPLES = [0.1, 0.15, 0.2, 0.25, 0.4, 0.45]                    # m/s
+DWA_VELOCITY_SAMPLES = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35]                    # m/s
+                                 # Max 0.35 m/s.  The 0.4/0.45 top end rammed walls
+                                 # because the rollout only saw ~2.6 cells ahead; here
+                                 # the faster top speed is paired with a LONGER rollout
+                                 # (below) so lookahead grows WITH speed (~3.4 cells at
+                                 # max) — faster in the open, still braking at corners.
 DWA_ANGULAR_SAMPLES  = [0, 2, 2.5, -2, -2.5, 3, -3, 3.5, -3.5, 4.5, -4.5]   # rad/s
-DWA_ROLLOUT_STEPS    = 6     # forward-prediction horizon (~192 ms at 32 ms tick)
+DWA_ROLLOUT_STEPS    = 10    # forward-prediction horizon (~320 ms at 32 ms tick);
+                             # lengthened alongside the higher top speed so the
+                             # endpoint-clearance penalty still sees walls in time
 DWA_HEADING_WEIGHT   = 4.0   # reward facing the target
 DWA_DISTANCE_WEIGHT  = 3.5   # reward closing distance to the target
 DWA_SPEED_WEIGHT     = 0.5   # reward higher speed
 DWA_CLEARANCE_WEIGHT = 2.0   # reward staying away from obstacles
+# Body-aware anti-clip: DWA scores the trajectory CENTRELINE, so a route whose
+# centre skims a wall lets the robot's body clip the corner.  Penalise (softly —
+# no hard reject, so a genuinely tight corridor still yields the least-bad move
+# instead of a stuck refusal) any rollout whose clearance to a known wall drops
+# below the robot's half-width.
+DWA_ROBOT_CLEAR_PX   = 3.0   # robot half-width in cells (~0.10 m); keep this much wall clearance
+DWA_CLEAR_PENALTY    = 4.0   # score penalty per cell of encroachment below DWA_ROBOT_CLEAR_PX
 
 PATH_FOLLOWING_TARGET_REACH_DIST_PX = 4   # px — waypoint considered reached within this
 FOLLOW_WAYPOINT_STRIDE = 5                # step ahead this many waypoints once one is reached (AURE)
@@ -167,6 +181,14 @@ FOLLOW_ALIGN_OMEGA = 2.5      # rad/s — pivot rate while aligning
 FRONTIER_MIN_CLUSTER       = 15   # min frontier cells to keep a cluster
 FRONTIER_MIN_SIZE          = 20   # min cluster size to score as a primary target
 FRONTIER_MIN_DIST_PX       = 5    # ignore frontiers closer than this (already here)
+# Drop frontier cells within this radius of the robot at DETECTION time.  The
+# cells in a small disk under the robot never get cleared (they sit below the
+# lidar's minimum range), so their boundary is a phantom frontier ring that moves
+# WITH the robot and can never be cleared — selecting it traps exploration in
+# place.  Must exceed the unmapped-disk radius (a few px).  Unlike
+# FRONTIER_MIN_DIST_PX (a scored-selector filter the random fallback ignores),
+# this removes the ring from candidacy entirely.
+FRONTIER_SELF_EXCLUDE_PX   = 12
 FRONTIER_VISITED_RADIUS_PX = 30   # a frontier centroid within this of a visited one is skipped
 FRONTIER_SCORE_BIAS        = 15   # utility = size / (distance + bias)
 # When the mission has SIGHTED the active target pillar, frontier/free-cell
@@ -188,6 +210,11 @@ EXPLORE_FREESPACE_TRIES             = 200 # attempts to sample a nearby free cel
 EXPLORE_SCAN_TURN_TICKS      = 18   # ticks to rotate in place when no path is available
 EXPLORE_SCAN_TURN_WHEEL      = 4.0  # wheel speed (rad/s) for the in-place reveal rotation
 EXPLORE_FORGET_VISITED_EVERY = 6    # clear the visited blacklist after this many no-path spins
+# Obstacle-recovery escalation: a straight reverse alone can't free a robot nosed
+# into a corner — it just backs out and the replan drives it in at the same angle
+# again (the wedge loop).  After this many consecutive obstacle recoveries, also
+# TURN toward the more-open side so the re-approach comes in at a new heading.
+OBSTACLE_RECOVER_TURN_AFTER  = 2
 
 # ── SLAM: FastSLAM 2.0 particle filter (verbatim from the reference CONSTANTS.py) ──
 SLAM_NUM_PARTICLES       = 30    # match reference.  observe cost ~ particles x beams; 30x45 (theirs)

@@ -38,13 +38,12 @@ import following
 from config import (
     CELL_FREE, CELL_UNKNOWN,
     FRONTIER_MIN_CLUSTER, FRONTIER_MIN_SIZE, FRONTIER_MIN_DIST_PX,
-    FRONTIER_VISITED_RADIUS_PX, FRONTIER_SCORE_BIAS,
+    FRONTIER_VISITED_RADIUS_PX, FRONTIER_SCORE_BIAS, FRONTIER_SELF_EXCLUDE_PX,
     PATH_FOLLOWING_TARGET_REACH_DIST_PX,
-    EXPLORATION_START_FRONTIER_AFTER, EXPLORATION_FRONTIER_SELECTION_FREQ,
     EXPLORE_FREESPACE_RADIUS_PX, EXPLORE_FREESPACE_TRIES,
     EXPLORE_SCAN_TURN_TICKS, EXPLORE_SCAN_TURN_WHEEL, EXPLORE_FORGET_VISITED_EVERY,
     SLAM_GREEN_PERIOD_STEPS, GREEN_MARK_ENABLED,
-    PILLAR_BIAS_WEIGHT,
+    PILLAR_BIAS_WEIGHT, OBSTACLE_RECOVER_TURN_AFTER,
 )
 
 # ── Reference MyRobot state (the fields exploration touches) ──────────────────
@@ -65,6 +64,10 @@ _follow_last_position = None
 _follow_stuck_count = 0
 FOLLOW_POSITION_THRESHOLD = 0.005   # m — min movement to not be considered stuck
 FOLLOW_STUCK_THRESHOLD = 25         # calls without movement to consider stuck
+
+# Consecutive obstacle recoveries without escaping — escalates to a turn (see
+# _recover_from_obstacle).  Reset when a new frontier follow starts / on reset.
+_obstacle_recover_streak = 0
 
 
 # ── self.step() override + odometry/mapping (reference step() + lidar thread) ─
@@ -237,10 +240,24 @@ def _recover_from_stuck(turn_duration=(400, 600)):
 
 
 def _recover_from_obstacle(turn_duration=(400, 600)):
-    """Reference recover_from_obstacle: reverse then settle (no turn)."""
+    """Reverse to back off a front obstacle, then settle.
+
+    Two changes from the reference recover_from_obstacle (which reversed straight,
+    no turn, and gated on the wrong sensor):
+      * The reverse-length gate reads REAR clearance — rl (index 1) and rr (index
+        3) — instead of the reference's fr (index 2).  fr is a FRONT sensor, so a
+        robot nosed into a corner always saw it blocked and only ever reversed
+        'shorter' (250 ms), never far enough to escape -> the wedge loop.  Matches
+        _recover_from_stuck, which correctly gates on rl+rr.
+      * Escalation: after OBSTACLE_RECOVER_TURN_AFTER consecutive recoveries the
+        straight reverse clearly isn't breaking the wedge (the replan keeps driving
+        back in at the same angle), so also TURN toward the more-open front side to
+        change the re-approach heading.
+    """
+    global _obstacle_recover_streak
     _set_robot_velocity(-8, -8)
-    distances = _get_distances()
-    if distances[2] > 0.25 and distances[3] > 0.25:
+    distances = _get_distances()   # [fl, rl, fr, rr]
+    if distances[1] > 0.25 and distances[3] > 0.25:   # rear-left AND rear-right clear
         print("reversing longer [recover from obstacle]")
         _tick(500)
     else:
@@ -253,6 +270,19 @@ def _recover_from_obstacle(turn_duration=(400, 600)):
             _stop_motor()
             return False
     _tick(250)
+
+    # Escalate on repeated wedges: turn toward whichever front side is more open
+    # (fl vs fr) so the replanned path re-approaches at a fresh angle.
+    _obstacle_recover_streak += 1
+    if _obstacle_recover_streak >= OBSTACLE_RECOVER_TURN_AFTER:
+        _obstacle_recover_streak = 0
+        duration = random.randint(turn_duration[0], turn_duration[1])
+        if distances[0] >= distances[2]:      # front-left clearer -> turn left
+            print("[recover from obstacle] wedged -> turning left to change approach")
+            _turn_left_milisecond(duration)
+        else:                                 # front-right clearer -> turn right
+            print("[recover from obstacle] wedged -> turning right to change approach")
+            _turn_right_milisecond(duration)
 
 
 # ── Initial scan (reference slowly_360) ───────────────────────────────────────
@@ -297,6 +327,16 @@ def detect_frontiers(grid):
     adj_unknown[:, :-1] |= unknown[:, 1:]
 
     ys, xs = np.where(free & adj_unknown)
+
+    # Drop the phantom near-field frontier ring: the unmapped disk under the robot
+    # (below lidar min range) is never cleared, so its boundary is a frontier ring
+    # that moves with the robot and can never be resolved.  Excluding cells within
+    # FRONTIER_SELF_EXCLUDE_PX of the robot keeps exploration from getting trapped
+    # selecting it in place.
+    rx, ry = _get_map_position()
+    far = (xs - rx) ** 2 + (ys - ry) ** 2 > FRONTIER_SELF_EXCLUDE_PX ** 2
+    xs, ys = xs[far], ys[far]
+
     cells = list(zip(xs.tolist(), ys.tolist()))
     return _cluster_frontiers_bfs(cells, FRONTIER_MIN_CLUSTER)
 
@@ -497,18 +537,22 @@ def frontier_following(path, replan_interval=20):
     (stride 5) to its fixed goal, with front-obstacle reverse+replan (<=2), a
     periodic blocked-path replan, and stuck reverse-turn+replan (<=3) before
     blacklisting.  Red-wall / column / green interrupts omitted (see module doc)."""
-    global _current_path
+    global _current_path, _obstacle_recover_streak
 
     if path is None or len(path) == 0:
         return False
 
+    _obstacle_recover_streak = 0        # fresh frontier -> reset the wedge counter
     frontier_goal = path[-1]
     current_path = list(path)
     _current_path = current_path
     timestep_counter = 0
     stuck_attempt_count = 0
     replan_attempts = 0
-    target_index = 5
+    # Start at the stride waypoint, but clamp to the last waypoint for short paths
+    # — otherwise `while target_index < len(path)` is false on entry and the whole
+    # follow no-ops (no drive, no sim step), which trapped the robot on close goals.
+    target_index = min(5, len(current_path) - 1)
     MAX_STUCK_ATTEMPTS = 3
 
     while target_index < len(current_path):
@@ -527,6 +571,7 @@ def frontier_following(path, replan_interval=20):
 
                 if replan_attempts >= 2:
                     print("[Frontier] Failed 2 times. Giving up on this frontier for now.")
+                    _visited.append(tuple(frontier_goal))   # blacklist so it isn't re-picked
                     return False
 
                 current_start = _get_map_position()
@@ -539,6 +584,7 @@ def frontier_following(path, replan_interval=20):
                     break
                 else:
                     print("[Frontier] No path found after obstacle. Dropping.")
+                    _visited.append(tuple(frontier_goal))   # blacklist so it isn't re-picked
                     return False
 
             # PERIODIC BLOCKED-PATH CHECK (only replan if a waypoint is now an obstacle)
@@ -588,76 +634,63 @@ def frontier_following(path, replan_interval=20):
 # ── Orchestration (reference handle_frontier_exploration + explore) ───────────
 
 def handle_frontier_exploration(count):
-    """Reference handle_frontier_exploration (exploration subset): every
-    SELECTION_FREQ iterations after START_FRONTIER_AFTER, detect + score-select a
-    frontier and follow it.  (Near-column chasing omitted — no column estimates
-    in pure exploration.)"""
+    """Detect frontiers, score-select the best (biased toward a sighted pillar when
+    set), plan a path to it, and RETURN (regions, chosen, path) — the caller drives.
+
+    Selection runs EVERY iteration (not every-Nth-after-a-warm-up as in the
+    reference).  Each explore() iteration drives a whole path, so the old cadence
+    meant ~4 of every 5 drives fell back to a random ALREADY-EXPLORED free cell
+    instead of a frontier; running selection every iteration keeps the robot
+    heading for the unexplored boundary.  (No internal follow here — that produced
+    a double-drive of the same path with explore().)"""
     global _current_goal
-    frontier_regions = []
-    chosen_frontier = None
+    frontier_regions = detect_frontiers(mapping.get_grid())
+    chosen_frontier = select_frontier_target(frontier_regions)
     path_to_frontier = None
-
-    # While biased toward a sighted pillar, select every iteration (bypass the
-    # warm-up/interval gate) so the robot heads for it promptly instead of on the
-    # every-Nth-after-warm-up cadence used for undirected exploration.
-    biased = _target_bias is not None
-    if biased or (count >= EXPLORATION_START_FRONTIER_AFTER
-                  and count % EXPLORATION_FRONTIER_SELECTION_FREQ == 0):
-        frontier_regions = detect_frontiers(mapping.get_grid())
-
-        chosen_frontier = select_frontier_target(frontier_regions)
-
-        if chosen_frontier:
-            # Log only when the target changes — biased selection runs every tick,
-            # so printing on every call would flood the console.
-            if chosen_frontier != _current_goal:
-                print(f"[EXPLORE] scored frontier {chosen_frontier} (iter {count})")
-            _current_goal = chosen_frontier
-            path_to_frontier = planning.plan_frontier(tuple(_get_map_position()), chosen_frontier)
-            if path_to_frontier:
-                frontier_following(path_to_frontier)
-
+    if chosen_frontier:
+        # Log only when the target changes (selection runs every iteration).
+        if chosen_frontier != _current_goal:
+            print(f"[EXPLORE] scored frontier {chosen_frontier} (iter {count})")
+        _current_goal = chosen_frontier
+        path_to_frontier = planning.plan_frontier(tuple(_get_map_position()), chosen_frontier)
     return frontier_regions, chosen_frontier, path_to_frontier
 
 
 def explore():
-    """Reference explore() loop (exploration subset): initial 360 scan, then
-    repeatedly select+follow a frontier, with a random-freespace fallback when no
-    frontier path is available.  Runs until the stop hook fires (via _tick)."""
+    """Exploration loop: initial 360 scan, then EVERY iteration head for the best
+    frontier (unexplored boundary); only when no reachable frontier exists fall
+    back to a nearby free cell (biased toward the pillar/unknown when set) or, if
+    even that fails, rotate in place to reveal new space.  Runs until the stop hook
+    fires (via _tick).  Frontier-first is the fix for the robot re-visiting
+    already-explored space: the old every-Nth cadence sent most drives to random
+    explored cells."""
     global _current_goal, _current_path, _no_path_streak
 
-    active_path = None
     count = 0
-
     _slowly_360()
 
     while _tick(devices.timestep) != -1:
-        frontier_regions, chosen_frontier, path_to_frontier = handle_frontier_exploration(count)
+        # Frontier-first, every iteration.
+        _regions, _chosen, path_to_target = handle_frontier_exploration(count)
 
-        # Fallback: no frontier path this iteration -> head to a nearby free cell
-        # (deterministic, not the reference's 20% chance — a probabilistic fallback
-        # leaves the robot idle most iterations, which is the stuck failure).
-        if path_to_frontier is None:
+        # Fallback ONLY when there is no reachable frontier (rare now): a nearby
+        # free cell, biased toward the pillar/unknown when a bias is set.
+        if path_to_target is None:
             fallback_cell = select_random_freespace_near_robot()
             if fallback_cell is not None:
                 _current_goal = fallback_cell
-                path_to_frontier = planning.plan_frontier(
+                path_to_target = planning.plan_frontier(
                     tuple(_get_map_position()), fallback_cell
                 )
 
-        # select only when nothing active
-        if active_path is None and path_to_frontier:
-            active_path = path_to_frontier
-
-        if active_path is not None:
-            frontier_following(active_path)
-            active_path = None
+        if path_to_target is not None:
+            frontier_following(path_to_target)
             _no_path_streak = 0
         else:
-            # NEITHER a frontier NOR a reachable free cell: the local frontiers are
+            # Neither a frontier NOR a reachable free cell: local frontiers are
             # exhausted or the visited blacklist has suppressed them.  Never idle —
-            # rotate in place to reveal new space, and periodically forget the
-            # blacklist so previously-dropped frontiers become selectable again.
+            # rotate to reveal new space, and periodically forget the blacklist so
+            # previously-dropped frontiers become selectable again.
             _no_path_streak += 1
             if _no_path_streak % EXPLORE_FORGET_VISITED_EVERY == 0 and _visited:
                 _visited.clear()
@@ -710,6 +743,7 @@ def reset():
     """Clear exploration state (visited frontiers, follow state, overlays, bias)."""
     global _visited, _current_goal, _current_path, _tick_count, _no_path_streak
     global _follow_last_position, _follow_stuck_count, _target_bias
+    global _obstacle_recover_streak
     _visited = []
     _current_goal = None
     _current_path = None
@@ -718,3 +752,4 @@ def reset():
     _follow_last_position = None
     _follow_stuck_count = 0
     _target_bias = None
+    _obstacle_recover_streak = 0
