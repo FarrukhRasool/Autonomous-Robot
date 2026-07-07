@@ -302,14 +302,18 @@ while devices.robot.step(devices.timestep) != -1:
         def _mission_should_continue():
             if viz_on:
                 pcs = mission.pillar_cells()
-                goals = [c for c in (pcs["blue"], pcs["yellow"]) if c is not None]
-                if not goals and exploration.current_goal() is not None:
-                    goals = [exploration.current_goal()]
+                goal = exploration.current_goal()
                 visualizer.render(
                     mapping.get_grid(),
                     robot_cell=mapping.robot_map_pos(localization.get_pose()),
-                    goals=goals,
-                    path=following.current_path() or exploration.current_path(),
+                    goals=[goal] if goal is not None else [],
+                    # Prefer the mission's full drive route (e.g. blue->yellow) so
+                    # the complete planned path is shown; fall back to follow/explore.
+                    path=(mission.current_path()
+                          or following.current_path()
+                          or exploration.current_path()),
+                    blue_cell=pcs["blue"],
+                    yellow_cell=pcs["yellow"],
                 )
             keys = set()
             kk = devices.keyboard.getKey()

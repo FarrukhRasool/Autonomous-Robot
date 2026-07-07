@@ -14,6 +14,7 @@ free/obstacle grid before search), matching AURE's global find_path.
 
 import heapq
 import math
+import time   # [PROF] temporary stall diagnostic
 
 import numpy as np
 import cv2
@@ -194,6 +195,7 @@ def plan(start_cell, goal_cell, grid=None, block_unknown=None, inflation_levels=
     so a path can never enter unmapped space).  Pass False for frontier-chasing,
     where routing THROUGH unknown to reach the boundary is the whole point.
     """
+    _t0 = time.perf_counter()   # [PROF] temporary stall diagnostic
     if grid is None:
         grid = mapping.get_grid()
     if block_unknown is None:
@@ -237,12 +239,23 @@ def plan(start_cell, goal_cell, grid=None, block_unknown=None, inflation_levels=
 
         length_m = _path_length_m(path)
         if length_m >= PATH_MIN_LENGTH_M:
+            _prof_plan(_t0, inflation_levels, path)   # [PROF]
             return path
         if length_m > best_len:
             best_len = length_m
             best_path = path
 
+    _prof_plan(_t0, inflation_levels, best_path)       # [PROF]
     return best_path
+
+
+def _prof_plan(t0, inflation_levels, path):
+    """[PROF] temporary stall diagnostic — remove once the stall is located.
+    Planning runs OUTSIDE the sim-step loop, so its wall-clock is dead sim time."""
+    dt = (time.perf_counter() - t0) * 1000.0
+    if dt > 8.0:
+        print(f"[PROF] plan {dt:5.0f}ms | levels={len(inflation_levels)} "
+              f"waypoints={len(path)}")
 
 
 def plan_frontier(start_cell, goal_cell, grid=None):

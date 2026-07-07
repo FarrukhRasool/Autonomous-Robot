@@ -30,6 +30,8 @@ from config import (
     SLAM_SCAN_MAX_BEAMS, SLAM_RESAMPLE_NEFF_RATIO, SLAM_LIKELIHOOD_SIGMA_M,
     SLAM_REFINE_RADIUS_PX, SLAM_REFINE_WINDOW_DEG, SLAM_REFINE_STEP_DEG,
     SLAM_OBSERVE_HZ, LOOP_CLOSURE_COOLDOWN_KEYFRAMES,
+    SLAM_OBSERVE_MIN_TRANS_M, SLAM_OBSERVE_MIN_ROT_RAD,
+    LOOP_CLOSURE_ATTEMPT_INTERVAL,
 )
 import mapping
 from pose_graph import PoseGraphSLAM, wrap_angle, apply_rigid_correction
@@ -72,6 +74,13 @@ class SlamSystem:
         self.pose_graph = PoseGraphSLAM()
         self._estimated_pose = np.array([0.0, 0.0, 0.0])
         self._last_closure_kf = -LOOP_CLOSURE_COOLDOWN_KEYFRAMES  # allow the first closure freely
+        self._last_attempt_kf = -LOOP_CLOSURE_ATTEMPT_INTERVAL     # throttle failed-attempt searches
+
+        # Motion accumulated by predict() since the last scan folded by observe().
+        # observe() only runs once these cross the SLAM_OBSERVE_MIN_* thresholds,
+        # then resets them — so the filter updates on motion, not on the clock.
+        self._acc_trans = 0.0
+        self._acc_rot = 0.0
 
     # ------------------------------------------------------------------
     # Motion update (called every simulation step)
@@ -93,6 +102,10 @@ class SlamSystem:
             particle.x += dtr * np.cos(particle.theta)
             particle.y += dtr * np.sin(particle.theta)
 
+        # Bank the motion so observe() can gate on distance travelled, not a timer.
+        self._acc_trans += abs(delta_trans)
+        self._acc_rot += abs(delta_rot)
+
         self._update_estimated_pose()
 
     # ------------------------------------------------------------------
@@ -103,43 +116,106 @@ class SlamSystem:
         proposal), weight particles by the refined residual, resample if needed,
         fold the scan into every surviving particle's (refined) map, then refresh
         the estimated pose, the canonical map, and the loop-closure pose graph.
+
+        Lock discipline (this is the ONLY writer of particle.log_odds, and runs on
+        the single background mapping thread).  predict() runs every control tick
+        and shares _LOCK with us, so it FREEZES the sim while we hold it.  Only the
+        pose state (particle x/y/theta, weights, the particle list, _estimated_pose,
+        _acc_*) is shared with predict(); particle.log_odds is not.  So the two
+        heavy loops -- the per-particle distance fields and the per-particle
+        rasterize -- run OFF-lock (they only read/write log_odds), and the lock is
+        held only around the short pose sections.  This keeps predict() (hence
+        robot.step()) from stalling on the 30-particle map grind.  Same algorithm,
+        same work -- just not under the lock.
         """
         if local_lidar_points is None or len(local_lidar_points) == 0:
             return
 
+        # Motion gate: skip if the robot has barely moved since the last update.
+        # _acc_* are shared with predict(), so gate + reset under the lock.  The
+        # accumulators keep summing across skipped cycles, so a slow crawl still
+        # triggers an update once it adds up.
+        with _LOCK:
+            if (self._acc_trans < SLAM_OBSERVE_MIN_TRANS_M
+                    and self._acc_rot < SLAM_OBSERVE_MIN_ROT_RAD):
+                return
+            self._acc_trans = 0.0
+            self._acc_rot = 0.0
+            particles = list(self.particles)   # stable object list for this cycle
+
+        _t0 = time.perf_counter()   # [PROF] temporary stall diagnostic
+
         scan = self._downsample_scan(local_lidar_points)
 
-        log_weights = np.empty(self.num_particles)
-        for i, particle in enumerate(self.particles):
-            dist_field = self._obstacle_distance_field(particle)
-            log_weights[i] = self._refine_pose(particle, scan, dist_field)
+        # OFF-lock: distance fields read only each particle's own map (never
+        # touched by predict), and are pose-independent -- the heavy
+        # cv2.distanceTransform work must not block the control loop.
+        dist_fields = [self._obstacle_distance_field(p) for p in particles]
+        _t_df = time.perf_counter()   # [PROF]
 
-        log_weights -= log_weights.max()
-        weights = np.exp(log_weights)
-        weights_sum = weights.sum()
-        if weights_sum <= 0 or not np.isfinite(weights_sum):
-            weights = np.full(self.num_particles, 1.0 / self.num_particles)
-        else:
-            weights = weights / weights_sum
+        # LOCKED: refine / reweight / resample all mutate pose state shared with
+        # predict.  Short + vectorised.  No resample has run yet this cycle, so
+        # self.particles is still `particles` (same objects) and aligns with
+        # dist_fields by index.
+        with _LOCK:
+            log_weights = np.empty(self.num_particles)
+            for i, particle in enumerate(self.particles):
+                log_weights[i] = self._refine_pose(particle, scan, dist_fields[i])
 
-        for particle, w in zip(self.particles, weights):
-            particle.weight = float(w)
+            log_weights -= log_weights.max()
+            weights = np.exp(log_weights)
+            weights_sum = weights.sum()
+            if weights_sum <= 0 or not np.isfinite(weights_sum):
+                weights = np.full(self.num_particles, 1.0 / self.num_particles)
+            else:
+                weights = weights / weights_sum
 
-        neff = 1.0 / np.sum(weights ** 2)
-        if neff < SLAM_RESAMPLE_NEFF_RATIO * self.num_particles:
-            self._resample(weights)
+            for particle, w in zip(self.particles, weights):
+                particle.weight = float(w)
 
-        for particle in self.particles:
-            world_points = self._transform_points(scan, particle.x, particle.y, particle.theta)
+            neff = 1.0 / np.sum(weights ** 2)
+            if neff < SLAM_RESAMPLE_NEFF_RATIO * self.num_particles:
+                self._resample(weights)
+
+            self._update_estimated_pose()
+            # Snapshot the committed (refined/resampled) poses + map refs so the
+            # off-lock rasterize uses exactly these poses even if predict() nudges
+            # the live particles before it runs.
+            snap = [(p.x, p.y, p.theta, p.log_odds) for p in self.particles]
+
+        _t_ref = time.perf_counter()   # [PROF]
+
+        # OFF-lock: fold the scan into each particle's own map.  Writes only
+        # particle.log_odds (single-writer, not shared with predict).
+        for px, py, pth, log_odds in snap:
+            world_points = self._transform_points(scan, px, py, pth)
             map_points = mapping.world_points_to_map(world_points)
-            robot_map_pos = mapping.world_points_to_map(
-                np.array([[particle.x, particle.y]])
-            )[0]
-            mapping.rasterize_scan(particle.log_odds, robot_map_pos, map_points, self.map_size)
+            robot_map_pos = mapping.world_points_to_map(np.array([[px, py]]))[0]
+            mapping.rasterize_scan(log_odds, robot_map_pos, map_points, self.map_size)
 
-        self._update_estimated_pose()
-        self._sync_canonical_map()
+        _t_rast = time.perf_counter()   # [PROF]
+
+        # LOCKED (brief): publish the canonical map for the control loop.
+        with _LOCK:
+            self._sync_canonical_map()
+
+        # OFF-lock: keyframe bookkeeping + loop-closure DETECTION only read the
+        # pose graph (single-writer, not shared with predict), so the growing
+        # candidate scan-match search must not hold the lock.  _update_pose_graph
+        # re-acquires the lock itself only for the rare closure COMMIT (which
+        # re-anchors the particle poses).
         self._update_pose_graph(scan)
+
+        # [PROF] temporary stall diagnostic — remove once the stall is located.
+        # Reports where observe() spends its GIL-holding wall-clock time.
+        _t_end = time.perf_counter()
+        _tot = (_t_end - _t0) * 1000.0
+        if _tot > 8.0:
+            print(f"[PROF] observe {_tot:5.0f}ms | "
+                  f"distfield {(_t_df - _t0) * 1000:4.0f} "
+                  f"refine {(_t_ref - _t_df) * 1000:4.0f} "
+                  f"rasterize {(_t_rast - _t_ref) * 1000:4.0f} "
+                  f"publish+graph {(_t_end - _t_rast) * 1000:4.0f}")
 
     def _obstacle_distance_field(self, particle):
         """Distance (in pixels) from every cell to the nearest obstacle cell in
@@ -219,41 +295,54 @@ class SlamSystem:
     # Loop closure
     # ------------------------------------------------------------------
     def _update_pose_graph(self, scan_local):
-        pose = self._estimated_pose
+        # Runs OFF the shared lock: everything here reads/writes only the pose
+        # graph (mutated solely by this single background thread, never by
+        # predict), EXCEPT the closure commit at the end, which re-anchors the
+        # particle poses and so takes the lock itself.
+        pose = self._estimated_pose.copy()
         new_index = self.pose_graph.add_keyframe(pose, scan_local)
         if new_index is None:
             return
 
-        # Cooldown: don't even ATTEMPT a closure (candidate search + correlative
-        # match + optimize + full-map rebuild) until enough keyframes have passed
-        # since the last one.  Without this, co-located keyframes (robot wedged in
-        # one spot) trigger a rebuild every frame -> O(keyframes^2) freeze.
+        # Cooldown: don't even ATTEMPT a closure until enough keyframes have
+        # passed since the last SUCCESSFUL one.
         if new_index - self._last_closure_kf < LOOP_CLOSURE_COOLDOWN_KEYFRAMES:
             return
+
+        # Attempt throttle: the candidate scan-match search runs even when it
+        # FAILS, and its cost grows with keyframe count -> only search every
+        # LOOP_CLOSURE_ATTEMPT_INTERVAL keyframes so it can't dominate the run as
+        # the map fills.  (A real revisit is still caught within the interval.)
+        if new_index - self._last_attempt_kf < LOOP_CLOSURE_ATTEMPT_INTERVAL:
+            return
+        self._last_attempt_kf = new_index
 
         if not self.pose_graph.try_loop_closure(new_index):
             return
 
+        # Closure found: optimize + rebuild the map OFF-lock (both only read the
+        # pose graph / build a fresh array), then COMMIT under the lock.
         self._last_closure_kf = new_index
         old_last_pose = self.pose_graph.nodes[new_index].copy()
         corrected_poses = self.pose_graph.optimize()
         new_last_pose = corrected_poses[new_index]
-        self.pose_graph.nodes = [p.copy() for p in corrected_poses]
-
-        particle_poses = np.array([[p.x, p.y, p.theta] for p in self.particles])
-        corrected_particle_poses = apply_rigid_correction(particle_poses, old_last_pose, new_last_pose)
-        for particle, corrected in zip(self.particles, corrected_particle_poses):
-            particle.x, particle.y, particle.theta = corrected
-
         rebuilt_log_odds = self.pose_graph.rebuild_log_odds(
             corrected_poses, self.map_size, self.resolution,
             mapping.world_points_to_map,
         )
-        for particle in self.particles:
-            particle.log_odds = rebuilt_log_odds.copy()
 
-        self._update_estimated_pose()
-        self._sync_canonical_map()
+        with _LOCK:
+            self.pose_graph.nodes = [p.copy() for p in corrected_poses]
+            particle_poses = np.array([[p.x, p.y, p.theta] for p in self.particles])
+            corrected_particle_poses = apply_rigid_correction(
+                particle_poses, old_last_pose, new_last_pose
+            )
+            for particle, corrected in zip(self.particles, corrected_particle_poses):
+                particle.x, particle.y, particle.theta = corrected
+            for particle in self.particles:
+                particle.log_odds = rebuilt_log_odds.copy()
+            self._update_estimated_pose()
+            self._sync_canonical_map()
         print(f"[SLAM] Loop closure applied: map rebuilt from {len(corrected_poses)} keyframes")
 
     # ------------------------------------------------------------------
@@ -266,11 +355,24 @@ class SlamSystem:
         """(map_x, map_y) for every particle, for the debug visualizer."""
         return [mapping.world_to_map(p.x, p.y) for p in self.particles]
 
-    def _best_particle(self):
-        return max(self.particles, key=lambda p: p.weight)
+    def _representative_particle(self):
+        """The particle nearest the (weighted-mean) estimated pose — a stable,
+        representative choice for publishing the canonical map.
+
+        Publishing the raw argmax-weight particle makes the map flicker:
+        FastSLAM 2.0's improved proposal refines every particle onto its own map,
+        driving weights to near-equal, so argmax flip-flops between spatially
+        different particles frame to frame.  The particle closest to the mean
+        pose sits in the centre of the cloud and shifts smoothly, and it keeps
+        the published map consistent with the pose get_pose() reports (also the
+        weighted mean) instead of a different particle's pose.
+        """
+        ex, ey = self._estimated_pose[0], self._estimated_pose[1]
+        return min(self.particles, key=lambda p: (p.x - ex) ** 2 + (p.y - ey) ** 2)
 
     def _sync_canonical_map(self):
-        mapping.sync_from_log_odds(self._best_particle().log_odds)
+        # Called right after _update_estimated_pose(), so _estimated_pose is fresh.
+        mapping.sync_from_log_odds(self._representative_particle().log_odds)
 
     def _update_estimated_pose(self):
         weights = np.array([p.weight for p in self.particles])
@@ -330,10 +432,12 @@ def predict(delta_trans, delta_rot):
 
 
 def observe(local_lidar_points):
-    """Measurement update (background mapping thread, or a forced main-thread
-    refresh).  Locked against predict() and other map writers."""
-    with _LOCK:
-        system().observe(local_lidar_points)
+    """Measurement update (background mapping thread).  SlamSystem.observe()
+    manages _LOCK itself with a narrow scope -- it holds the lock only around the
+    short pose sections and runs the heavy per-particle map work off-lock, so
+    predict() (every control tick) never stalls on the full update.  Do NOT wrap
+    the whole call in _LOCK here, or that decoupling is lost."""
+    system().observe(local_lidar_points)
 
 
 def estimated_pose():

@@ -44,6 +44,7 @@ from config import (
     EXPLORE_FREESPACE_RADIUS_PX, EXPLORE_FREESPACE_TRIES,
     EXPLORE_SCAN_TURN_TICKS, EXPLORE_SCAN_TURN_WHEEL, EXPLORE_FORGET_VISITED_EVERY,
     SLAM_GREEN_PERIOD_STEPS, GREEN_MARK_ENABLED,
+    PILLAR_BIAS_WEIGHT,
 )
 
 # ── Reference MyRobot state (the fields exploration touches) ──────────────────
@@ -53,6 +54,11 @@ _current_path = None          # for the live-map overlay
 _should_continue = None       # stop hook; when it returns False, _tick() aborts like sim-end
 _tick_count = 0               # sim ticks since run start (paces the SLAM observe cadence)
 _no_path_streak = 0           # consecutive iterations with no frontier/freespace path (anti-idle)
+# World (x, y) of a SIGHTED active target pillar.  When set (by the mission via
+# set_target_bias), frontier and free-cell selection are steered toward it so
+# exploration heads for the pillar instead of wandering agnostically; None = pure
+# frontier exploration (e.g. the standalone E-key mode never sets it).
+_target_bias = None
 
 # follow_local_target stuck-detection state (reference __init__ values)
 _follow_last_position = None
@@ -327,13 +333,40 @@ def _cluster_frontiers_bfs(frontier_cells, min_cluster_size=15):
 
 # ── Frontier selection (reference select_frontier_target / target2 / freespace) ──
 
+def _bias_map_cell():
+    """The sighted target pillar as a (float) map cell, or None if unbiased."""
+    if _target_bias is None:
+        return None
+    return np.array(mapping.world_to_map(_target_bias[0], _target_bias[1]), dtype=float)
+
+
+def _bias_multiplier(robot_pos, goal_cell, bias_cell):
+    """Utility multiplier 1 + PILLAR_BIAS_WEIGHT * alignment, where alignment in
+    [0, 1] is how well the robot->goal direction points toward the robot->pillar
+    direction (cosine, clamped at 0 so goals pointing away are just neutral, not
+    penalised)."""
+    v_goal = np.asarray(goal_cell, dtype=float) - robot_pos
+    v_bias = bias_cell - robot_pos
+    ng = np.linalg.norm(v_goal)
+    nb = np.linalg.norm(v_bias)
+    if ng < 1e-6 or nb < 1e-6:
+        return 1.0
+    alignment = max(0.0, float(np.dot(v_goal, v_bias) / (ng * nb)))
+    return 1.0 + PILLAR_BIAS_WEIGHT * alignment
+
+
 def select_frontier_target(frontier_regions):
     """Reference select_frontier_target: score size/(dist+bias); skip small/close/
-    visited; return best cluster's CENTROID, else select_frontier_target2()."""
+    visited; return best cluster's CENTROID, else select_frontier_target2().
+
+    When a target pillar has been sighted (_target_bias set), each cluster's score
+    is multiplied by _bias_multiplier so clusters in the pillar's direction win —
+    steering exploration toward it (FR5) instead of purely maximising new area."""
     if not frontier_regions:
         return None
 
     robot_map_pos = _get_map_position()
+    bias_cell = _bias_map_cell()
     best_score = -float("inf")
     best_region = None
 
@@ -354,6 +387,8 @@ def select_frontier_target(frontier_regions):
             continue
 
         score = size / (dist + FRONTIER_SCORE_BIAS)
+        if bias_cell is not None:
+            score *= _bias_multiplier(robot_map_pos, centroid, bias_cell)
         if score > best_score:
             best_score = score
             best_region = region
@@ -379,13 +414,23 @@ def select_frontier_target2(frontier_regions):
 
 
 def select_random_freespace_near_robot(radius=EXPLORE_FREESPACE_RADIUS_PX, max_tries=EXPLORE_FREESPACE_TRIES):
-    """Reference select_random_freespace_near_robot: a random FREESPACE cell near the robot."""
+    """Reference select_random_freespace_near_robot: a random FREESPACE cell near
+    the robot.
+
+    When a pillar is sighted (_target_bias set), return the sampled free cell
+    NEAREST the pillar instead of the first random hit — a greedy step toward it.
+    This matters in open rooms: once the walls are mapped there are few frontiers,
+    so this anti-idle fallback does most of the driving, and it must advance toward
+    the target rather than wander."""
     grid = mapping.get_grid()
     if grid is None:
         return None
     map_h, map_w = grid.shape
     rx, ry = _get_map_position()
+    bias_cell = _bias_map_cell()
 
+    best = None
+    best_bias_dist = float("inf")
     for _ in range(max_tries):
         dx = random.randint(-radius, radius)
         dy = random.randint(-radius, radius)
@@ -397,8 +442,13 @@ def select_random_freespace_near_robot(radius=EXPLORE_FREESPACE_RADIUS_PX, max_t
             continue
         if _there_is_obstacle((x, y)):
             continue
-        return (x, y)
-    return None
+        if bias_cell is None:
+            return (x, y)                       # unbiased: first valid hit (as before)
+        d = (x - bias_cell[0]) ** 2 + (y - bias_cell[1]) ** 2
+        if d < best_bias_dist:                  # biased: keep the one nearest the pillar
+            best_bias_dist = d
+            best = (x, y)
+    return best
 
 
 # ── DWA follow (reference dwa_planner via following.dwa_velocity + follow_local_target) ──
@@ -547,7 +597,12 @@ def handle_frontier_exploration(count):
     chosen_frontier = None
     path_to_frontier = None
 
-    if count >= EXPLORATION_START_FRONTIER_AFTER and count % EXPLORATION_FRONTIER_SELECTION_FREQ == 0:
+    # While biased toward a sighted pillar, select every iteration (bypass the
+    # warm-up/interval gate) so the robot heads for it promptly instead of on the
+    # every-Nth-after-warm-up cadence used for undirected exploration.
+    biased = _target_bias is not None
+    if biased or (count >= EXPLORATION_START_FRONTIER_AFTER
+                  and count % EXPLORATION_FRONTIER_SELECTION_FREQ == 0):
         frontier_regions = detect_frontiers(mapping.get_grid())
 
         chosen_frontier = select_frontier_target(frontier_regions)
@@ -635,10 +690,23 @@ def current_path():
     return _current_path
 
 
+def set_target_bias(world_xy):
+    """Steer frontier/free-cell selection toward this world (x, y) — the mission
+    calls this each tick once the active pillar has been sighted.  None restores
+    pure (unbiased) frontier exploration."""
+    global _target_bias
+    _target_bias = (float(world_xy[0]), float(world_xy[1])) if world_xy is not None else None
+
+
+def clear_target_bias():
+    global _target_bias
+    _target_bias = None
+
+
 def reset():
-    """Clear exploration state (visited frontiers, follow state, overlays)."""
+    """Clear exploration state (visited frontiers, follow state, overlays, bias)."""
     global _visited, _current_goal, _current_path, _tick_count, _no_path_streak
-    global _follow_last_position, _follow_stuck_count
+    global _follow_last_position, _follow_stuck_count, _target_bias
     _visited = []
     _current_goal = None
     _current_path = None
@@ -646,3 +714,4 @@ def reset():
     _no_path_streak = 0
     _follow_last_position = None
     _follow_stuck_count = 0
+    _target_bias = None
