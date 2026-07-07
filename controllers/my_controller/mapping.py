@@ -38,6 +38,7 @@ from config import (
     LOGODDS_INIT, LOGODDS_FREE, LOGODDS_OCC, LOGODDS_LOCK, LOGODDS_CLIP,
     P_OCC, P_FREE,
     CELL_FREE, CELL_OCC, CELL_UNKNOWN, CELL_CLOSED, CELL_GREEN,
+    CELL_BLUE, CELL_YELLOW,
 )
 
 
@@ -168,7 +169,9 @@ def _grid_from_log_odds(log_odds, prev_grid):
 
     closed_mask = (prev_grid == CELL_CLOSED)
     green_mask = (prev_grid == CELL_GREEN)
-    protected = closed_mask | green_mask
+    blue_mask = (prev_grid == CELL_BLUE)
+    yellow_mask = (prev_grid == CELL_YELLOW)
+    protected = closed_mask | green_mask | blue_mask | yellow_mask
 
     unknown_mask = (log_odds == LOGODDS_INIT) & (~protected)
     obstacle_mask = (P > P_OCC) & (~protected)
@@ -184,6 +187,8 @@ def _grid_from_log_odds(log_odds, prev_grid):
     # Restore protected cells so sensor updates never erase them.
     new_grid[green_mask] = CELL_GREEN
     new_grid[closed_mask] = CELL_CLOSED
+    new_grid[blue_mask] = CELL_BLUE
+    new_grid[yellow_mask] = CELL_YELLOW
     return new_grid
 
 
@@ -219,8 +224,28 @@ def mark_green(pose, points_local):
         _grid = new_grid
 
 
+def mark_pillar(cell, color, radius_cells=1):
+    """Stamp a small disk around `cell` with the pillar colour code (CELL_BLUE /
+    CELL_YELLOW).  Called by the mission once a pillar is confirmed within the
+    registration distance.  Pillar cells are protected from sensor overwrites by
+    _grid_from_log_odds and remain physical obstacles (there_is_obstacle)."""
+    code = CELL_BLUE if color == "blue" else CELL_YELLOW if color == "yellow" else None
+    if code is None or cell is None:
+        return
+    cx, cy = int(cell[0]), int(cell[1])
+    global _grid
+    with LOCK:
+        new_grid = _grid.copy()
+        for dy in range(-radius_cells, radius_cells + 1):
+            for dx in range(-radius_cells, radius_cells + 1):
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
+                    new_grid[ny, nx] = code
+        _grid = new_grid
+
+
 def there_is_obstacle(map_cell):
-    """True if the given (map_x, map_y) cell is OCCUPIED / GREEN / CLOSED.
+    """True if the given (map_x, map_y) cell is OCCUPIED / GREEN / CLOSED / a pillar.
 
     Out-of-bounds cells are treated as blocked so callers never plan off-grid.
     """
@@ -228,7 +253,8 @@ def there_is_obstacle(map_cell):
     if not (0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE):
         return True
     cell = _grid[y, x]
-    return cell == CELL_OCC or cell == CELL_GREEN or cell == CELL_CLOSED
+    return (cell == CELL_OCC or cell == CELL_GREEN or cell == CELL_CLOSED
+            or cell == CELL_BLUE or cell == CELL_YELLOW)
 
 
 def get_grid():
@@ -299,6 +325,8 @@ def save_png(path="map.png", path_cells=None, blue_cell=None, yellow_cell=None):
     img[_grid == CELL_OCC] = (0, 0, 0)
     img[_grid == CELL_CLOSED] = (128, 0, 128)
     img[_grid == CELL_GREEN] = (0, 180, 0)
+    img[_grid == CELL_BLUE] = (0, 0, 255)         # blue pillar (registered)
+    img[_grid == CELL_YELLOW] = (255, 255, 0)     # yellow pillar (registered)
 
     if path_cells:
         for (x, y) in path_cells:

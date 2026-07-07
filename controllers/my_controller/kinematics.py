@@ -12,12 +12,17 @@ left (about +z). Units are SI throughout: v in m/s, omega in rad/s,
 wheel angular velocities in rad/s.
 """
 
-# Husarion RosBot mechanical constants (user-supplied for this milestone).
-WHEEL_RADIUS_M = 0.0425
-WHEEL_TRACK_M = 0.197
+# Husarion RosBot mechanical constants — matched to the reference project's
+# CONSTANTS.py (WHEEL_RADIUS=0.043, AXLE_LENGTH=0.18) for parity: the wheel radius
+# sets the encoder->distance scale (SLAM translation input) and the track sets the
+# twist->wheel-speed differential; using the reference's values keeps odometry and
+# actuation consistent with its tuning.
+WHEEL_RADIUS_M = 0.043
+WHEEL_TRACK_M = 0.18
 
-# Conservative cap on per-wheel angular velocity sent to the motors.
-MAX_WHEEL_SPEED_RAD_S = 26.0
+# Per-wheel angular velocity cap sent to the motors (reference MAX_VELOCITY=36;
+# also normalises the DWA speed reward via MAX_SPEED = this * WHEEL_RADIUS_M).
+MAX_WHEEL_SPEED_RAD_S = 36.0
 
 
 def wheel_speeds_from_twist(v, omega,
