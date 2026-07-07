@@ -35,7 +35,7 @@ def target_world_position(pose, bearing_rad, distance_m):
         wx = px + bx*cos(theta) - by*sin(theta)
         wy = py + bx*sin(theta) + by*cos(theta)
     """
-    if pose is None or bearing_rad is None or distance_m is None:
+    if pose is None or bearing_rad is None or distance_m is None:   
         return None
     if not math.isfinite(distance_m) or distance_m <= 0.0:
         return None

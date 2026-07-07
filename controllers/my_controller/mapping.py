@@ -28,6 +28,7 @@ Discrete grid (P = sigmoid(clip(log_odds))):
 
 import math
 import struct
+import threading
 import zlib
 
 import numpy as np
@@ -37,8 +38,17 @@ from config import (
     LOGODDS_INIT, LOGODDS_FREE, LOGODDS_OCC, LOGODDS_LOCK, LOGODDS_CLIP,
     P_OCC, P_FREE,
     CELL_FREE, CELL_OCC, CELL_UNKNOWN, CELL_CLOSED, CELL_GREEN,
+    CELL_BLUE, CELL_YELLOW,
 )
 
+
+# Guards every WRITER of the shared map/particle state so the background SLAM
+# mapping thread (slam.observe -> sync_from_log_odds) can't tear a concurrent
+# write by a main-thread writer (mark_green / clear) or by slam.predict.  Readers
+# (get_grid / there_is_obstacle) run unlocked: the grid is only ever swapped in
+# atomically (rebind), so a reader always sees a complete grid, just possibly one
+# cycle stale — matching the reference's unlocked-reader design.
+LOCK = threading.RLock()
 
 _HALF = MAP_SIZE // 2
 
@@ -87,6 +97,17 @@ def _world_points_to_map(points_world):
     return pts.astype(np.int32)
 
 
+def world_points_to_map(points_world):
+    """Public form of the internal Nx2 world->map projection.
+
+    Identical formula to the reference GridMap.convert_to_map_coordinate_matrix
+    (points @ [[1/res,0],[0,-1/res]].T + [HALF, HALF], int32).  Used by
+    slam.py / pose_graph.py to rasterize per-particle / per-keyframe scans into
+    the same cell frame as the canonical map.
+    """
+    return _world_points_to_map(np.asarray(points_world, dtype=np.float64))
+
+
 def _bresenham(x0, y0, x1, y1):
     """Integer grid cells from (x0,y0) to (x1,y1) inclusive (AURE bresenham_line)."""
     points = []
@@ -112,65 +133,106 @@ def _bresenham(x0, y0, x1, y1):
 
 # ── Occupancy update ─────────────────────────────────────────────────────────
 
-def _update_log_odds(robot_map, map_points):
-    """Accumulate log-odds along each ray: free on the path, occupied at the hit."""
-    rx, ry = int(robot_map[0]), int(robot_map[1])
-    for mx, my in map_points:
-        cells = _bresenham(rx, ry, int(mx), int(my))
-        # Free evidence for every cell the ray passes through (all but the hit).
-        for (cx, cy) in cells[:-1]:
-            if 0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE:
-                if _log_odds[cy, cx] < LOGODDS_LOCK:   # sticky-wall lock
-                    _log_odds[cy, cx] += LOGODDS_FREE
-        # Occupied evidence for the endpoint cell (unconditional, as in AURE).
-        ex, ey = cells[-1]
-        if 0 <= ex < MAP_SIZE and 0 <= ey < MAP_SIZE:
-            _log_odds[ey, ex] += LOGODDS_OCC
+def rasterize_scan(log_odds_array, robot_map_pos, map_points, map_size=MAP_SIZE):
+    """Bresenham log-odds raycast update on an ARBITRARY log-odds array.
+
+    Ported from the reference map.rasterize_scan so the raycasting math lives in
+    exactly one place, shared by SLAM (slam.py / pose_graph.py, per-particle and
+    per-keyframe maps).  The canonical grid is published from the best particle
+    via sync_from_log_odds().
+
+    Each ray: every cell it passes through gets FREE evidence (+= LOGODDS_FREE,
+    negative), unless the cell is locked at/above LOGODDS_LOCK (a sticky wall,
+    never eroded); the ray's endpoint cell gets OCC evidence (+= LOGODDS_OCC).
+
+    Vectorised DDA form of the per-beam Bresenham loop: ray i has Chebyshev-
+    distance nsteps[i] cells between robot and endpoint, so sampling s=0..nsteps[i]
+    at fraction s/nsteps[i] reproduces the Bresenham cells (the dominant axis
+    advances exactly one cell per step, so there are no intra-ray duplicates).
+    Done as NumPy array ops it runs ~50x faster and releases the GIL — essential
+    because this runs on the background SLAM thread (30x per update, and once per
+    keyframe during loop-closure rebuild); a Python loop here froze the control
+    loop.  Cross-ray order at a cell that is both a hit and a pass-through was
+    already ambiguous in the per-beam loop (it depended on beam order), so
+    applying all OCC then all lock-gated FREE stays within that same ambiguity.
+    """
+    pts = np.asarray(map_points, dtype=np.int64).reshape(-1, 2)
+    if pts.shape[0] == 0:
+        return
+    rx, ry = int(robot_map_pos[0]), int(robot_map_pos[1])
+    ex, ey = pts[:, 0], pts[:, 1]          # endpoints (x=col, y=row)
+
+    # Endpoint OCC evidence (unconditional, as in AURE).
+    ok = (ex >= 0) & (ex < map_size) & (ey >= 0) & (ey < map_size)
+    np.add.at(log_odds_array, (ey[ok], ex[ok]), LOGODDS_OCC)
+
+    # Free cells along each ray: s = 0 .. nsteps-1 (endpoint excluded above).
+    dx = ex - rx
+    dy = ey - ry
+    nsteps = np.maximum(np.abs(dx), np.abs(dy))       # cells per ray
+    max_steps = int(nsteps.max())
+    if max_steps == 0:
+        return                                        # every endpoint on the robot cell
+
+    s = np.arange(max_steps)                          # free-sample indices
+    denom = np.maximum(nsteps, 1)[:, None].astype(np.float64)
+    frac = s[None, :] / denom                         # (rays, samples)
+    fx = np.rint(rx + dx[:, None] * frac).astype(np.int64)
+    fy = np.rint(ry + dy[:, None] * frac).astype(np.int64)
+
+    free = s[None, :] < nsteps[:, None]               # samples belonging to each ray
+    fx = fx[free]
+    fy = fy[free]
+
+    inb = (fx >= 0) & (fx < map_size) & (fy >= 0) & (fy < map_size)
+    fx = fx[inb]
+    fy = fy[inb]
+
+    # Sticky-wall lock: FREE is negative, so it only ever lowers a cell — a cell
+    # already at/above LOCK is never eroded.  Masking on the current value (== the
+    # pre-FREE value, since FREE can't lift a cell to LOCK) matches the per-cell
+    # check; duplicate pass-throughs across rays each subtract, as in the loop.
+    below = log_odds_array[fy, fx] < LOGODDS_LOCK
+    np.add.at(log_odds_array, (fy[below], fx[below]), LOGODDS_FREE)
 
 
-def _update_grid_map():
-    """Threshold the log-odds field into the discrete grid, protecting special cells."""
-    limited = np.clip(_log_odds, -LOGODDS_CLIP, LOGODDS_CLIP)
+def _grid_from_log_odds(log_odds, prev_grid):
+    """Threshold a log-odds field into a NEW discrete grid, preserving the
+    protected (GREEN / CLOSED) cells of prev_grid.  Returns a fresh array so the
+    caller can swap it into place atomically (never mutating a grid a reader may
+    be holding)."""
+    limited = np.clip(log_odds, -LOGODDS_CLIP, LOGODDS_CLIP)
     P = 1.0 / (1.0 + np.exp(-limited))
 
-    closed_mask = (_grid == CELL_CLOSED)
-    green_mask = (_grid == CELL_GREEN)
-    protected = closed_mask | green_mask
+    closed_mask = (prev_grid == CELL_CLOSED)
+    green_mask = (prev_grid == CELL_GREEN)
+    blue_mask = (prev_grid == CELL_BLUE)
+    yellow_mask = (prev_grid == CELL_YELLOW)
+    protected = closed_mask | green_mask | blue_mask | yellow_mask
 
-    unknown_mask = (_log_odds == LOGODDS_INIT) & (~protected)
+    unknown_mask = (log_odds == LOGODDS_INIT) & (~protected)
     obstacle_mask = (P > P_OCC) & (~protected)
     free_mask = (P < P_FREE) & (~protected)
 
-    _grid[obstacle_mask] = CELL_OCC
-    _grid[free_mask] = CELL_FREE
-    _grid[unknown_mask] = CELL_UNKNOWN
-
+    new_grid = np.empty_like(prev_grid)
+    new_grid[obstacle_mask] = CELL_OCC
+    new_grid[free_mask] = CELL_FREE
+    new_grid[unknown_mask] = CELL_UNKNOWN
+    # Cells that are none of the above keep their prior value (rare transitional band).
+    other = ~(obstacle_mask | free_mask | unknown_mask)
+    new_grid[other] = prev_grid[other]
     # Restore protected cells so sensor updates never erase them.
-    _grid[green_mask] = CELL_GREEN
-    _grid[closed_mask] = CELL_CLOSED
+    new_grid[green_mask] = CELL_GREEN
+    new_grid[closed_mask] = CELL_CLOSED
+    new_grid[blue_mask] = CELL_BLUE
+    new_grid[yellow_mask] = CELL_YELLOW
+    return new_grid
 
 
-def lidar_update(pose, points_local):
-    """Update the occupancy grid from one lidar scan.
-
-    Parameters
-    ----------
-    pose : (x_m, y_m, theta_rad)
-        Robot pose in the reset-anchored world frame at scan time.
-    points_local : array-like, shape (N, 2)
-        Lidar points in the robot body frame as [x_forward, y_left], metres,
-        already inf/nan-filtered.  Empty input is a no-op.
-    """
-    if pose is None or points_local is None:
-        return
-    pts = np.asarray(points_local, dtype=np.float64)
-    if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] != 2:
-        return
-
-    points_world = _transform_to_world(pts, pose)
-    map_points = _world_points_to_map(points_world)
-    _update_log_odds(robot_map_pos(pose), map_points)
-    _update_grid_map()
+def _update_grid_map():
+    """Rebuild the canonical grid from _log_odds and swap it in atomically."""
+    global _grid
+    _grid = _grid_from_log_odds(_log_odds, _grid)
 
 
 # ── Queries ──────────────────────────────────────────────────────────────────
@@ -178,9 +240,9 @@ def lidar_update(pose, points_local):
 def mark_green(pose, points_local):
     """Stamp projected green-ground body points as CELL_GREEN (forbidden terrain).
 
-    Parameters mirror lidar_update: pose is (x, y, theta); points_local is Nx2
-    body-frame [x_forward, y_left].  Green cells are protected from later sensor
-    overwrites by update_grid_map(), so once marked they persist.
+    pose is (x, y, theta); points_local is Nx2 body-frame [x_forward, y_left].
+    Green cells are protected from later sensor overwrites by _update_grid_map(),
+    so once marked they persist.
     """
     if pose is None or points_local is None:
         return
@@ -188,40 +250,39 @@ def mark_green(pose, points_local):
     if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] != 2:
         return
     map_points = _world_points_to_map(_transform_to_world(pts, pose))
-    for mx, my in map_points:
-        if 0 <= mx < MAP_SIZE and 0 <= my < MAP_SIZE:
-            _grid[my, mx] = CELL_GREEN
+    # Build on a copy and swap atomically under the lock, so the background SLAM
+    # thread's grid swap and this main-thread write never clobber each other.
+    global _grid
+    with LOCK:
+        new_grid = _grid.copy()
+        for mx, my in map_points:
+            if 0 <= mx < MAP_SIZE and 0 <= my < MAP_SIZE:
+                new_grid[my, mx] = CELL_GREEN
+        _grid = new_grid
 
 
-def mark_robot_free(pose, radius_cells=2):
-    """Force the robot's own footprint to FREE, correcting phantom walls.
-
-    The robot is physically at this pose, so any OCCUPIED or GREEN cell under
-    its body must be spurious — a phantom wall from odometry slip, or a
-    mis-projected green streak (the robot is never allowed onto real green).
-    We reset those cells to strongly-free, also clearing the sticky-wall lock so
-    driving back through a distorted area repairs it.  CLOSED (deliberate
-    corridor closures) are preserved.
-    """
-    if pose is None:
+def mark_pillar(cell, color, radius_cells=1):
+    """Stamp a small disk around `cell` with the pillar colour code (CELL_BLUE /
+    CELL_YELLOW).  Called by the mission once a pillar is confirmed within the
+    registration distance.  Pillar cells are protected from sensor overwrites by
+    _grid_from_log_odds and remain physical obstacles (there_is_obstacle)."""
+    code = CELL_BLUE if color == "blue" else CELL_YELLOW if color == "yellow" else None
+    if code is None or cell is None:
         return
-    mx, my = world_to_map(pose[0], pose[1])
-    r2 = radius_cells * radius_cells
-    for dy in range(-radius_cells, radius_cells + 1):
-        for dx in range(-radius_cells, radius_cells + 1):
-            if dx * dx + dy * dy > r2:
-                continue
-            cx, cy = mx + dx, my + dy
-            if not (0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE):
-                continue
-            if _grid[cy, cx] == CELL_CLOSED:
-                continue
-            _log_odds[cy, cx] = -LOGODDS_CLIP      # strongly free; clears any lock
-            _grid[cy, cx] = CELL_FREE
+    cx, cy = int(cell[0]), int(cell[1])
+    global _grid
+    with LOCK:
+        new_grid = _grid.copy()
+        for dy in range(-radius_cells, radius_cells + 1):
+            for dx in range(-radius_cells, radius_cells + 1):
+                nx, ny = cx + dx, cy + dy
+                if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
+                    new_grid[ny, nx] = code
+        _grid = new_grid
 
 
 def there_is_obstacle(map_cell):
-    """True if the given (map_x, map_y) cell is OCCUPIED / GREEN / CLOSED.
+    """True if the given (map_x, map_y) cell is OCCUPIED / GREEN / CLOSED / a pillar.
 
     Out-of-bounds cells are treated as blocked so callers never plan off-grid.
     """
@@ -229,7 +290,8 @@ def there_is_obstacle(map_cell):
     if not (0 <= x < MAP_SIZE and 0 <= y < MAP_SIZE):
         return True
     cell = _grid[y, x]
-    return cell == CELL_OCC or cell == CELL_GREEN or cell == CELL_CLOSED
+    return (cell == CELL_OCC or cell == CELL_GREEN or cell == CELL_CLOSED
+            or cell == CELL_BLUE or cell == CELL_YELLOW)
 
 
 def get_grid():
@@ -237,11 +299,26 @@ def get_grid():
     return _grid
 
 
+def sync_from_log_odds(log_odds_array):
+    """Replace the canonical log-odds field + discrete grid from an externally
+    owned log-odds array (ported from the reference GridMap.sync_from_log_odds).
+
+    SlamSystem publishes its best particle's map through this each observe().
+    GREEN / CLOSED cells already in the grid are preserved because
+    _update_grid_map() protects them.
+    """
+    global _log_odds
+    with LOCK:
+        _log_odds = np.asarray(log_odds_array, dtype=np.float32).copy()
+        _update_grid_map()          # rebuilds + atomically swaps _grid
+
+
 def clear():
     """Reset the log-odds field and discrete grid back to all-UNKNOWN."""
     global _log_odds, _grid
-    _log_odds = np.full((MAP_SIZE, MAP_SIZE), LOGODDS_INIT, dtype=np.float32)
-    _grid = np.full((MAP_SIZE, MAP_SIZE), CELL_UNKNOWN, dtype=np.uint8)
+    with LOCK:
+        _log_odds = np.full((MAP_SIZE, MAP_SIZE), LOGODDS_INIT, dtype=np.float32)
+        _grid = np.full((MAP_SIZE, MAP_SIZE), CELL_UNKNOWN, dtype=np.uint8)
 
 
 # ── Reporting ────────────────────────────────────────────────────────────────
@@ -285,6 +362,8 @@ def save_png(path="map.png", path_cells=None, blue_cell=None, yellow_cell=None):
     img[_grid == CELL_OCC] = (0, 0, 0)
     img[_grid == CELL_CLOSED] = (128, 0, 128)
     img[_grid == CELL_GREEN] = (0, 180, 0)
+    img[_grid == CELL_BLUE] = (0, 0, 255)         # blue pillar (registered)
+    img[_grid == CELL_YELLOW] = (255, 255, 0)     # yellow pillar (registered)
 
     if path_cells:
         for (x, y) in path_cells:
