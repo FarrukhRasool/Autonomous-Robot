@@ -143,15 +143,12 @@ class SlamSystem:
             self._acc_rot = 0.0
             particles = list(self.particles)   # stable object list for this cycle
 
-        _t0 = time.perf_counter()   # [PROF] temporary stall diagnostic
-
         scan = self._downsample_scan(local_lidar_points)
 
         # OFF-lock: distance fields read only each particle's own map (never
         # touched by predict), and are pose-independent -- the heavy
         # cv2.distanceTransform work must not block the control loop.
         dist_fields = [self._obstacle_distance_field(p) for p in particles]
-        _t_df = time.perf_counter()   # [PROF]
 
         # LOCKED: refine / reweight / resample all mutate pose state shared with
         # predict.  Short + vectorised.  No resample has run yet this cycle, so
@@ -183,8 +180,6 @@ class SlamSystem:
             # the live particles before it runs.
             snap = [(p.x, p.y, p.theta, p.log_odds) for p in self.particles]
 
-        _t_ref = time.perf_counter()   # [PROF]
-
         # OFF-lock: fold the scan into each particle's own map.  Writes only
         # particle.log_odds (single-writer, not shared with predict).
         for px, py, pth, log_odds in snap:
@@ -192,8 +187,6 @@ class SlamSystem:
             map_points = mapping.world_points_to_map(world_points)
             robot_map_pos = mapping.world_points_to_map(np.array([[px, py]]))[0]
             mapping.rasterize_scan(log_odds, robot_map_pos, map_points, self.map_size)
-
-        _t_rast = time.perf_counter()   # [PROF]
 
         # LOCKED (brief): publish the canonical map for the control loop.
         with _LOCK:
@@ -205,17 +198,6 @@ class SlamSystem:
         # re-acquires the lock itself only for the rare closure COMMIT (which
         # re-anchors the particle poses).
         self._update_pose_graph(scan)
-
-        # [PROF] temporary stall diagnostic — remove once the stall is located.
-        # Reports where observe() spends its GIL-holding wall-clock time.
-        _t_end = time.perf_counter()
-        _tot = (_t_end - _t0) * 1000.0
-        if _tot > 8.0:
-            print(f"[PROF] observe {_tot:5.0f}ms | "
-                  f"distfield {(_t_df - _t0) * 1000:4.0f} "
-                  f"refine {(_t_ref - _t_df) * 1000:4.0f} "
-                  f"rasterize {(_t_rast - _t_ref) * 1000:4.0f} "
-                  f"publish+graph {(_t_end - _t_rast) * 1000:4.0f}")
 
     def _obstacle_distance_field(self, particle):
         """Distance (in pixels) from every cell to the nearest obstacle cell in
