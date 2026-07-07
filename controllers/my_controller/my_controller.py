@@ -19,6 +19,7 @@ import perception
 import planning
 import following
 import exploration
+import mission
 import slam
 import visualizer
 from autonomous import autonomous_step, reset_autonomous_state, reset_mission_state
@@ -48,7 +49,7 @@ print(
     "G autonomous mode | I sensor snapshot | L toggle sensor log | "
     "O pose snapshot | R reset pose & map | M map summary | "
     "P target bearings | B set goal | V plan to goal | C live map view | "
-    "Y follow path | E explore"
+    "Y follow path | E explore | X mission (blue->yellow)"
 )
 
 
@@ -123,6 +124,7 @@ while devices.robot.step(devices.timestep) != -1:
         follow_mode = False
         following.reset()
         exploration.reset()
+        mission.reset()
         reset_this_step = True
         print("[POSE] reset to (0, 0, 0); map cleared; targets & path cleared")
 
@@ -267,6 +269,46 @@ while devices.robot.step(devices.timestep) != -1:
         motion.stop_robot()
         v_cmd = omega_cmd = 0.0
         print("Explore mode OFF")
+
+    # ── X: blue-then-yellow mission (FR5) — faithful blocking port. ────────────
+    #     Explores to find both columns, then drives blue->yellow. ──────────────
+    if ord('X') in new_keys or ord('x') in new_keys:
+        follow_mode = False
+        auto_mode = False
+        following.reset()
+        reset_autonomous_state()
+
+        mission_stop = {"armed": False}
+        _MSTOP_KEYS = {ord('X'), ord('x'), ord(' ')}
+
+        def _mission_should_continue():
+            if viz_on:
+                pcs = mission.pillar_cells()
+                goals = [c for c in (pcs["blue"], pcs["yellow"]) if c is not None]
+                if not goals and exploration.current_goal() is not None:
+                    goals = [exploration.current_goal()]
+                visualizer.render(
+                    mapping.get_grid(),
+                    robot_cell=mapping.robot_map_pos(localization.get_pose()),
+                    goals=goals,
+                    path=following.current_path() or exploration.current_path(),
+                )
+            keys = set()
+            kk = devices.keyboard.getKey()
+            while kk != -1:
+                keys.add(kk)
+                kk = devices.keyboard.getKey()
+            if not mission_stop["armed"]:
+                if not (keys & _MSTOP_KEYS):
+                    mission_stop["armed"] = True
+                return True
+            return not (keys & _MSTOP_KEYS)
+
+        print("Mission ON — blue-then-yellow (X/Space to stop)")
+        mission.run(_mission_should_continue)
+        motion.stop_robot()
+        v_cmd = omega_cmd = 0.0
+        print("Mission OFF")
 
     # ── Hard stop: Space exits autonomous/follow mode and zeroes twist ────────
     if ord(' ') in new_keys:

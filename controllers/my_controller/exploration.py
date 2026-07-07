@@ -42,6 +42,7 @@ from config import (
     PATH_FOLLOWING_TARGET_REACH_DIST_PX,
     EXPLORATION_START_FRONTIER_AFTER, EXPLORATION_FRONTIER_SELECTION_FREQ,
     EXPLORE_FREESPACE_RADIUS_PX, EXPLORE_FREESPACE_TRIES,
+    EXPLORE_SCAN_TURN_TICKS, EXPLORE_SCAN_TURN_WHEEL, EXPLORE_FORGET_VISITED_EVERY,
     SLAM_GREEN_PERIOD_STEPS, GREEN_MARK_ENABLED,
 )
 
@@ -51,6 +52,7 @@ _current_goal = None          # for the live-map overlay
 _current_path = None          # for the live-map overlay
 _should_continue = None       # stop hook; when it returns False, _tick() aborts like sim-end
 _tick_count = 0               # sim ticks since run start (paces the SLAM observe cadence)
+_no_path_streak = 0           # consecutive iterations with no frontier/freespace path (anti-idle)
 
 # follow_local_target stuck-detection state (reference __init__ values)
 _follow_last_position = None
@@ -260,6 +262,18 @@ def _slowly_360():
         if _tick(devices.timestep) == -1:
             break
         steps_taken += 1
+    _stop_motor()
+
+
+def _rotate_in_place(ticks):
+    """Turn in place for `ticks` sim steps to reveal new space.  Anti-idle escape
+    when no frontier/freespace path is available — rotating never translates the
+    robot into a wall and always changes what the sensors (and thus the next
+    frontier selection) can see."""
+    _set_robot_velocity(EXPLORE_SCAN_TURN_WHEEL, -EXPLORE_SCAN_TURN_WHEEL)
+    for _ in range(ticks):
+        if _tick(devices.timestep) == -1:
+            break
     _stop_motor()
 
 
@@ -552,7 +566,7 @@ def explore():
     """Reference explore() loop (exploration subset): initial 360 scan, then
     repeatedly select+follow a frontier, with a random-freespace fallback when no
     frontier path is available.  Runs until the stop hook fires (via _tick)."""
-    global _current_goal, _current_path
+    global _current_goal, _current_path, _no_path_streak
 
     active_path = None
     count = 0
@@ -562,25 +576,35 @@ def explore():
     while _tick(devices.timestep) != -1:
         frontier_regions, chosen_frontier, path_to_frontier = handle_frontier_exploration(count)
 
-        # Fallback: no frontier/path -> pick random nearby freespace
+        # Fallback: no frontier path this iteration -> head to a nearby free cell
+        # (deterministic, not the reference's 20% chance — a probabilistic fallback
+        # leaves the robot idle most iterations, which is the stuck failure).
         if path_to_frontier is None:
-            if random.random() < 0.2:
-                fallback_frontier = select_random_freespace_near_robot()
-                if fallback_frontier is not None:
-                    chosen_frontier = fallback_frontier
-                    _current_goal = chosen_frontier
-                    path_to_frontier = planning.plan_frontier(
-                        tuple(_get_map_position()), chosen_frontier
-                    )
+            fallback_cell = select_random_freespace_near_robot()
+            if fallback_cell is not None:
+                _current_goal = fallback_cell
+                path_to_frontier = planning.plan_frontier(
+                    tuple(_get_map_position()), fallback_cell
+                )
 
         # select only when nothing active
         if active_path is None and path_to_frontier:
             active_path = path_to_frontier
 
-        # follow if active
         if active_path is not None:
             frontier_following(active_path)
             active_path = None
+            _no_path_streak = 0
+        else:
+            # NEITHER a frontier NOR a reachable free cell: the local frontiers are
+            # exhausted or the visited blacklist has suppressed them.  Never idle —
+            # rotate in place to reveal new space, and periodically forget the
+            # blacklist so previously-dropped frontiers become selectable again.
+            _no_path_streak += 1
+            if _no_path_streak % EXPLORE_FORGET_VISITED_EVERY == 0 and _visited:
+                _visited.clear()
+                print("[Explore] no path — cleared visited-frontier blacklist")
+            _rotate_in_place(EXPLORE_SCAN_TURN_TICKS)
 
         count += 1
 
@@ -613,11 +637,12 @@ def current_path():
 
 def reset():
     """Clear exploration state (visited frontiers, follow state, overlays)."""
-    global _visited, _current_goal, _current_path, _tick_count
+    global _visited, _current_goal, _current_path, _tick_count, _no_path_streak
     global _follow_last_position, _follow_stuck_count
     _visited = []
     _current_goal = None
     _current_path = None
     _tick_count = 0
+    _no_path_streak = 0
     _follow_last_position = None
     _follow_stuck_count = 0
