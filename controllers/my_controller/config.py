@@ -117,13 +117,19 @@ ASTAR_PENALTY_STRENGTH = 2.0        # cost weight pushing paths away from walls
 ASTAR_HEURISTIC_WEIGHT = 1.2        # A* heuristic multiplier (matches AURE)
 PLAN_BLOCK_UNKNOWN     = True       # only route through mapped-free space (never through
                                     # UNKNOWN) — paths can't run into unmapped walls
+ASTAR_FRONTIER_INFLATION = 4        # px — single inflation level for the frontier planner
+                                    # (plan_frontier), which ALLOWS routing through UNKNOWN
 
 # ── DWA local path follower (AURE) ────────────────────────────────────────────
-DWA_VELOCITY_SAMPLES = [0.0, 0.1, 0.2, 0.3]   # m/s; 0.0 lets DWA rotate in place to escape
-DWA_ANGULAR_SAMPLES  = [0.0, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 2.5, -2.5]  # rad/s (gentler)
-DWA_ROLLOUT_STEPS    = 15    # forward-prediction horizon (control steps)
-DWA_ROBOT_RADIUS_PX  = 2     # px — body clearance; MUST stay < min(ASTAR_INFLATION_LEVELS)
-                             # so DWA can drive its own (inflation-3) planned paths
+# Values ported verbatim from the reference project's working DWA.  Note: NO 0.0
+# velocity sample — the robot never pivots in place, it always creeps-and-steers
+# (angular up to ±4.5 rad/s arcs even a U-turn), which is what keeps its motion
+# smooth (no jerky in-place spin).  Obstacle safety comes from the inflated
+# planned path + a direct-collision reject + soft clearance scoring (no hard
+# body-radius reject).
+DWA_VELOCITY_SAMPLES = [0.1, 0.15, 0.2, 0.25, 0.4, 0.45]                    # m/s
+DWA_ANGULAR_SAMPLES  = [0, 2, 2.5, -2, -2.5, 3, -3, 3.5, -3.5, 4.5, -4.5]   # rad/s
+DWA_ROLLOUT_STEPS    = 6     # forward-prediction horizon (~192 ms at 32 ms tick)
 DWA_HEADING_WEIGHT   = 4.0   # reward facing the target
 DWA_DISTANCE_WEIGHT  = 3.5   # reward closing distance to the target
 DWA_SPEED_WEIGHT     = 0.5   # reward higher speed
@@ -160,8 +166,43 @@ FOLLOW_ALIGN_OMEGA = 2.5      # rad/s — pivot rate while aligning
 FRONTIER_MIN_CLUSTER       = 15   # min frontier cells to keep a cluster
 FRONTIER_MIN_SIZE          = 20   # min cluster size to score as a primary target
 FRONTIER_MIN_DIST_PX       = 5    # ignore frontiers closer than this (already here)
-FRONTIER_VISITED_RADIUS_PX = 8    # a frontier within this of a visited one is skipped
+FRONTIER_VISITED_RADIUS_PX = 30   # a frontier centroid within this of a visited one is skipped
 FRONTIER_SCORE_BIAS        = 15   # utility = size / (distance + bias)
+
+# Orchestration cadence (verbatim from the reference CONSTANTS.py).
+EXPLORATION_START_FRONTIER_AFTER    = 50  # start scored frontier selection after N outer iterations
+EXPLORATION_FRONTIER_SELECTION_FREQ = 5   # select a new frontier every N outer iterations
+EXPLORE_FREESPACE_RADIUS_PX         = 40  # px — random-freespace fallback search radius
+EXPLORE_FREESPACE_TRIES             = 200 # attempts to sample a nearby free cell
+
+# ── SLAM: FastSLAM 2.0 particle filter (verbatim from the reference CONSTANTS.py) ──
+SLAM_NUM_PARTICLES       = 15    # number of particles (reference uses 30; halved for real-time in
+                                 # Webots — observe cost scales linearly with this)
+SLAM_ALPHA1              = 0.02  # motion noise: rotation error from translation
+SLAM_ALPHA2              = 0.02  # motion noise: rotation error from rotation
+SLAM_ALPHA3              = 0.05  # motion noise: translation error from translation
+SLAM_ALPHA4              = 0.01  # motion noise: translation error from rotation
+SLAM_SCAN_MAX_BEAMS      = 90    # downsample a scan to at most this many beams for scoring/rasterizing
+SLAM_RESAMPLE_NEFF_RATIO = 0.5   # resample when effective sample size < ratio * num_particles
+SLAM_LIKELIHOOD_SIGMA_M  = 0.08  # std-dev (m) of the likelihood-field Gaussian used to weight particles
+SLAM_REFINE_RADIUS_PX    = 2     # +/- px searched to snap each particle onto its own map (FastSLAM 2.0 proposal)
+SLAM_REFINE_WINDOW_DEG   = 6.0   # +/- deg searched for the same pose-refinement step
+SLAM_REFINE_STEP_DEG     = 2.0   # angular step size for the pose-refinement search
+SLAM_OBSERVE_HZ = 10             # measurement-update rate of the background mapping thread
+                                 # (matches the reference's ~10 Hz lidar thread; only when not turning)
+SLAM_GREEN_PERIOD_STEPS = 3      # main-thread green-ground marking cadence (~10 Hz at 32 ms tick)
+
+# ── SLAM: pose-graph loop closure (verbatim from the reference CONSTANTS.py) ───
+# Consumed by pose_graph.py.
+KEYFRAME_DIST_THRESHOLD_M      = 0.15   # add a new keyframe after moving this far
+KEYFRAME_ANGLE_THRESHOLD_DEG   = 15.0   # ...or turning this much since the last keyframe
+LOOP_CLOSURE_SEARCH_RADIUS_M   = 0.6    # only consider keyframes within this radius as candidates
+LOOP_CLOSURE_MIN_KEYFRAME_GAP  = 15     # ignore the most recent N keyframes (avoid trivial closures)
+LOOP_CLOSURE_SCORE_THRESHOLD   = 0.06   # max mean nearest-neighbour distance (m) to accept a match
+LOOP_CLOSURE_SEARCH_WINDOW_M   = 0.3    # coarse search window (+/- m) for dx, dy in scan matching
+LOOP_CLOSURE_SEARCH_STEP_M     = 0.033  # step size (1 px) for dx, dy coarse search
+LOOP_CLOSURE_SEARCH_WINDOW_DEG = 20.0   # coarse search window (+/- deg) for dtheta
+LOOP_CLOSURE_SEARCH_STEP_DEG   = 2.0    # step size (deg) for dtheta coarse search
 
 # Recovery maneuver when the follower reports "stuck" (wedged against a wall):
 # reverse (if the rear is clear), then turn a fixed spell, then re-select.

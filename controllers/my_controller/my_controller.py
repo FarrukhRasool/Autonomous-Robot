@@ -18,13 +18,15 @@ import mapping
 import perception
 import planning
 import following
+import exploration
+import slam
 import visualizer
 from autonomous import autonomous_step, reset_autonomous_state, reset_mission_state
 from sensor_debug import format_compact_sensors, format_sensor_snapshot
 from config import (
     TARGET_LIN_VEL, TARGET_ANG_VEL, FRONT_STOP_DIST,
     POSE_LOG_PERIOD_STEPS,
-    MAP_UPDATE_PERIOD_STEPS, MAP_UPDATE_MAX_OMEGA,
+    SLAM_GREEN_PERIOD_STEPS,
     VIZ_PERIOD_STEPS, GREEN_MARK_ENABLED, FOLLOW_MAX_RETRIES,
 )
 
@@ -35,7 +37,6 @@ test_timer       = 0
 sensor_log       = False
 auto_mode        = False
 block_timer      = 0
-prev_omega       = 0.0   # last step's applied yaw rate — gates mapping while turning
 plan_targets     = []    # up to 2 goal cells captured by B; V plans between them
 last_route       = None  # most recently planned path, shown in the live view
 viz_on           = False # live cv2 map window toggle (C key)
@@ -47,7 +48,7 @@ print(
     "G autonomous mode | I sensor snapshot | L toggle sensor log | "
     "O pose snapshot | R reset pose & map | M map summary | "
     "P target bearings | B set goal | V plan to goal | C live map view | "
-    "Y follow path"
+    "Y follow path | E explore"
 )
 
 
@@ -55,6 +56,11 @@ OVERHEAD_CENTER_BLOCK_DIST = 0.55
 OVERHEAD_SIDE_WARN_DIST = 0.40
 OVERHEAD_SLOW_VEL = 0.04
 OVERHEAD_STEER_OMEGA = 0.12
+
+
+# Start the background SLAM mapping thread (folds lidar scans into the map at
+# ~10 Hz off the control loop; localization feeds it motion deltas every step).
+slam.start_mapping_thread(sensors.read_lidar_pointcloud_2d, motion.is_turning)
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
@@ -67,25 +73,20 @@ while devices.robot.step(devices.timestep) != -1:
     gyro_z              = sensors.read_gyro_z()
     localization.update_from_encoders(left_rad, right_rad, imu_yaw, gyro_z)
 
-    # ── Mapping update (AURE log-odds occupancy from lidar point cloud) ────────
-    # Throttled to bound per-step cost, and skipped while turning fast (rotation
-    # smears the scan) — a single-loop analog of AURE's "update when not turning"
-    # background mapper.  prev_omega is last step's applied yaw rate.
-    robot_x, robot_y, robot_theta = localization.get_pose()
-    # The robot is physically here -> its footprint is free.  Runs every step and
-    # repairs any phantom walls left by odometry slip while wedged.
-    mapping.mark_robot_free((robot_x, robot_y, robot_theta))
+    # ── Pose + green marking ───────────────────────────────────────────────────
+    # SLAM runs on its own background thread (started before this loop): it folds
+    # lidar scans into the map (slam.observe) at ~10 Hz and localization feeds it
+    # motion deltas via slam.predict every step.  This loop only reads the pose
+    # and stamps green ground (camera-based, so it stays on the main thread; the
+    # grid write is done under mapping.LOCK inside mark_green).
+    robot_x, robot_y, robot_theta = localization.get_pose()   # SLAM estimate
     if (not reset_this_step
-            and step_count % MAP_UPDATE_PERIOD_STEPS == 0
-            and abs(prev_omega) < MAP_UPDATE_MAX_OMEGA):
-        cloud = sensors.read_lidar_pointcloud_2d()
-        if len(cloud) > 0:
-            mapping.lidar_update((robot_x, robot_y, robot_theta), cloud)
-        # Stamp detected green ground as forbidden so planning/DWA avoid it.
-        if GREEN_MARK_ENABLED:
-            green_pts = sensors.green_ground_points_body()
-            if len(green_pts) > 0:
-                mapping.mark_green((robot_x, robot_y, robot_theta), green_pts)
+            and GREEN_MARK_ENABLED
+            and step_count % SLAM_GREEN_PERIOD_STEPS == 0
+            and not motion.is_turning()):
+        green_pts = sensors.green_ground_points_body()
+        if len(green_pts) > 0:
+            mapping.mark_green((robot_x, robot_y, robot_theta), green_pts)
 
     # Keyboard edge detection: new_keys fires only on the step a key first appears
     pressed_now = set()
@@ -121,6 +122,7 @@ while devices.robot.step(devices.timestep) != -1:
         last_route = None
         follow_mode = False
         following.reset()
+        exploration.reset()
         reset_this_step = True
         print("[POSE] reset to (0, 0, 0); map cleared; targets & path cleared")
 
@@ -224,6 +226,48 @@ while devices.robot.step(devices.timestep) != -1:
             following.reset()
             print("Follow mode OFF")
 
+    # ── E: frontier exploration (faithful blocking port of the reference).
+    #     Runs its own sim-step loop until E or Space is pressed again. ─────────
+    if ord('E') in new_keys or ord('e') in new_keys:
+        follow_mode = False
+        auto_mode = False
+        following.reset()
+        reset_autonomous_state()
+
+        # `armed` guards against the E press that STARTED exploration (still held
+        # for a few sim steps) immediately cancelling it: only listen for a stop
+        # key AFTER E/Space has first been released.
+        explore_stop = {"armed": False}
+        _STOP_KEYS = {ord('E'), ord('e'), ord(' ')}
+
+        def _explore_should_continue():
+            # Polled every sim tick inside exploration: refresh the live map and
+            # stop on a FRESH E/Space press (edge, not the held start key).
+            if viz_on:
+                visualizer.render(
+                    mapping.get_grid(),
+                    robot_cell=mapping.robot_map_pos(localization.get_pose()),
+                    goals=[exploration.current_goal()] if exploration.current_goal() else [],
+                    path=exploration.current_path(),
+                )
+            keys = set()
+            kk = devices.keyboard.getKey()
+            while kk != -1:
+                keys.add(kk)
+                kk = devices.keyboard.getKey()
+            if not explore_stop["armed"]:
+                # Wait for the start key to be released before honouring a stop.
+                if not (keys & _STOP_KEYS):
+                    explore_stop["armed"] = True
+                return True
+            return not (keys & _STOP_KEYS)
+
+        print("Explore mode ON — frontier exploration (E/Space to stop)")
+        exploration.run(_explore_should_continue)
+        motion.stop_robot()
+        v_cmd = omega_cmd = 0.0
+        print("Explore mode OFF")
+
     # ── Hard stop: Space exits autonomous/follow mode and zeroes twist ────────
     if ord(' ') in new_keys:
         v_cmd = omega_cmd = 0.0
@@ -311,7 +355,6 @@ while devices.robot.step(devices.timestep) != -1:
 
     # ── Apply twist ────────────────────────────────────────────────────────────
     v_real, omega_real, wL, wR = motion.drive_twist(v_cmd, omega_cmd)
-    prev_omega = omega_real
 
     # ── Live map view (inline cv2 window, throttled) ──────────────────────────
     if viz_on and step_count % VIZ_PERIOD_STEPS == 0:
