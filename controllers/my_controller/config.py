@@ -101,6 +101,8 @@ CELL_OCC     = 1
 CELL_UNKNOWN = 255
 CELL_CLOSED  = 200  # reserved — closure marking (later milestone)
 CELL_GREEN   = 190  # reserved — green carpet (later milestone)
+CELL_BLUE    = 100  # blue pillar, stamped once confirmed at the pillar (ref BLUE_COLUMN)
+CELL_YELLOW  = 150  # yellow pillar, stamped once confirmed at the pillar (ref YELLOW_COLUMN)
 
 # Mapping update scheduling (single-loop port of AURE's threaded lidar mapper):
 MAP_UPDATE_PERIOD_STEPS = 1     # rebuild the grid every control step (freshest map for DWA)
@@ -108,8 +110,7 @@ MAP_UPDATE_MAX_OMEGA    = 5.0   # rad/s — only skip mapping during very fast s
                                 # (DWA turns up to ~2.5 rad/s must still map, or it drives blind)
 
 # ── Path planning (AURE A* + clearance + spline) ──────────────────────────────
-ASTAR_INFLATION_LEVELS = [4, 3]     # px — min (3) must stay > DWA_ROBOT_RADIUS_PX so DWA can
-                                    # follow its own paths (else it rejects them and "sticks")
+ASTAR_INFLATION_LEVELS = [4, 3, 2]  # px — match reference; escalates down to 2 for tight passages
 ASTAR_EXPANSION_PIXELS = 3          # px — free-disk radius around start/goal endpoints
 PATH_MIN_LENGTH_M      = 0.8        # m — shorter A* results are retried at thinner inflation
 ASTAR_SAFE_DISTANCE_PX = 5.0        # px — clearance band within which the wall penalty applies
@@ -184,13 +185,14 @@ EXPLORE_SCAN_TURN_WHEEL      = 4.0  # wheel speed (rad/s) for the in-place revea
 EXPLORE_FORGET_VISITED_EVERY = 6    # clear the visited blacklist after this many no-path spins
 
 # ── SLAM: FastSLAM 2.0 particle filter (verbatim from the reference CONSTANTS.py) ──
-SLAM_NUM_PARTICLES       = 15    # number of particles (reference uses 30; halved for real-time in
-                                 # Webots — observe cost scales linearly with this)
+SLAM_NUM_PARTICLES       = 30    # match reference.  observe cost ~ particles x beams; 30x45 (theirs)
+                                 # = 15x90 (our old) in COST, but 30 particles gives a far better pose
+                                 # estimate -> crisper map.  Particle count, not beam count, drives pose.
 SLAM_ALPHA1              = 0.02  # motion noise: rotation error from translation
 SLAM_ALPHA2              = 0.02  # motion noise: rotation error from rotation
 SLAM_ALPHA3              = 0.05  # motion noise: translation error from translation
 SLAM_ALPHA4              = 0.01  # motion noise: translation error from rotation
-SLAM_SCAN_MAX_BEAMS      = 90    # downsample a scan to at most this many beams for scoring/rasterizing
+SLAM_SCAN_MAX_BEAMS      = 45    # match reference (was 90); paired with 30 particles for same total cost
 SLAM_RESAMPLE_NEFF_RATIO = 0.5   # resample when effective sample size < ratio * num_particles
 SLAM_LIKELIHOOD_SIGMA_M  = 0.08  # std-dev (m) of the likelihood-field Gaussian used to weight particles
 SLAM_REFINE_RADIUS_PX    = 2     # +/- px searched to snap each particle onto its own map (FastSLAM 2.0 proposal)
@@ -234,9 +236,22 @@ SEEK_OMEGA                = 0.40  # rad/s — yaw rate while orienting toward ta
 SEEK_BEARING_DEADBAND_RAD = 0.10  # rad   — |bearing| at or below this counts as centred
 
 # ── Mission (FR5: reach blue, then yellow) ────────────────────────────────────
-TARGET_REACHED_DIST_M     = 0.50  # m     — pillar depth below this counts as reached
-APPROACH_OFFSET_M         = 0.40  # m     — aim this far in front of a pillar (its cell is an obstacle)
-MISSION_REACHED_RATIO     = 0.25  # frame fraction a pillar fills that also counts as reached
-MISSION_MARK_DIST_M       = 1.00  # m     — a visible pillar within this range is "found" (its world
-                                  # position is trusted enough to record and later navigate to)
-MISSION_LIDAR_REACHED_M   = 0.35  # m     — front-lidar range that also counts as "at the pillar"
+TARGET_REACHED_DIST_M     = 0.50  # m     — legacy reactive target-reached depth (autonomous.py G-mode)
+APPROACH_OFFSET_M         = 0.30  # m     — A* stand-off in front of a pillar; MUST be < the mark gate
+                                  # (MISSION_MARK_LASER_M) or the robot parks just short and never marks
+# Registration gate: a pillar is only marked "seen/visited" (stamped on the map in
+# its colour + FSM advances) once the robot is CONFIRMED within this distance and
+# the pillar is visible.  A distant glimpse is used to navigate toward the pillar
+# but never registers it — the robot must approach to confirm.
+# The depth-based column distance (estimate_column_distance Pythagoras) is NOT
+# trustworthy for the mark gate: it saturates to inf at contact and badly
+# UNDER-estimates far pillars (a ~5 m pillar read as 1.49 m), which caused false
+# "reached" marks from across the map.  So a pillar is registered ONLY on signals
+# that reliably mean "genuinely at the pillar" (matching the reference
+# follow_final_path reached-logic): it fills the view, OR the front laser is at
+# contact range while the pillar is centred.  The depth distance is used only to
+# navigate TOWARD a pillar (direction), never to confirm arrival.
+MISSION_MARK_RATIO        = 0.20  # frame fraction a pillar must fill to count as reached (ref 0.20)
+MISSION_MARK_LASER_M      = 0.35  # m   — front-laser contact range that confirms a centred pillar (ref 0.35)
+MISSION_MARK_BEARING_RAD  = 0.25  # rad — |pillar bearing| must be within this to trust the laser signal
+MISSION_MARK_MAX_STAMP_M  = 0.60  # m   — clamp for where the pillar cell is stamped (reliable close range)

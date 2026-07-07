@@ -39,24 +39,32 @@ import planning
 import perception
 import exploration
 from config import (
-    APPROACH_OFFSET_M, TARGET_REACHED_DIST_M, MISSION_REACHED_RATIO,
-    MISSION_LIDAR_REACHED_M,
+    APPROACH_OFFSET_M, MISSION_MARK_RATIO,
+    MISSION_MARK_LASER_M, MISSION_MARK_BEARING_RAD, MISSION_MARK_MAX_STAMP_M,
     GREEN_MARK_ENABLED, SLAM_GREEN_PERIOD_STEPS,
     FOLLOW_WAYPOINT_STRIDE,
+    SEEK_LIN_VEL, SEEK_OMEGA, SEEK_BEARING_DEADBAND_RAD,
 )
 
 SEEKING_BLUE, SEEKING_YELLOW, DONE = 0, 1, 2
 _NAMES = {SEEKING_BLUE: "SEEKING_BLUE", SEEKING_YELLOW: "SEEKING_YELLOW", DONE: "DONE"}
 
 # ── State ─────────────────────────────────────────────────────────────────────
-_seen = {"blue": False, "yellow": False}    # printed-once flag when a column is first seen close
+# _seen: printed-once flag when a column is first spotted (any distance) — a
+#        sighting sets perception memory so the robot can navigate toward it.
+# _registered: the pillar has been CONFIRMED at contact range and stamped
+#        on the map in its colour (the "visited/seen" mark the min-distance gate
+#        controls).  A distant glimpse never registers a pillar.
+_seen = {"blue": False, "yellow": False}
+_registered = {"blue": False, "yellow": False}
 _state = SEEKING_BLUE
 _tick_count = 0
 
 
 def reset():
-    global _seen, _state, _tick_count
+    global _seen, _registered, _state, _tick_count
     _seen = {"blue": False, "yellow": False}
+    _registered = {"blue": False, "yellow": False}
     _state = SEEKING_BLUE
     _tick_count = 0
     perception.reset_target_memory()
@@ -75,32 +83,36 @@ def pillar_cells():
     return out
 
 
-# ── Perception: mark columns while exploring (reference camera-thread logic) ───
+# ── Perception: localize columns (any distance) + register when close ─────────
 
-def _column_close(color, colors):
-    """Their column-close / reached heuristic, on this project's detection dict:
-    the column fills enough of the frame, OR its depth estimate is near, OR the
-    front lidar is close."""
+def _within_mark_dist(color, colors):
+    """True only if `color` is CONFIRMED genuinely at the pillar — via signals that
+    don't depend on the unreliable depth-Pythagoras distance:
+      1. the mask fills MISSION_MARK_RATIO of the frame (pillar dominates view), OR
+      2. the front LASER is at contact range (< MISSION_MARK_LASER_M) while the
+         pillar is centred (|bearing| < MISSION_MARK_BEARING_RAD) — a wall can't
+         trigger it because the pillar must be visible AND pointing forward.
+    (The depth distance is deliberately NOT used here: it underestimates far
+    pillars badly, which caused false 'reached' marks from across the map.)
+    """
     if not colors.get(color):
         return False
     ratio = colors.get(f"{color}_ratio", 0.0)
-    dist = colors.get(f"{color}_distance_m", float("inf"))
-    if ratio >= MISSION_REACHED_RATIO:
+    bearing = colors.get(f"{color}_bearing_rad")
+    if ratio >= MISSION_MARK_RATIO:
         return True
-    if math.isfinite(dist) and dist < TARGET_REACHED_DIST_M:
-        return True
-    if exploration._get_lidar_front_min_dist(angle_range_deg=15) < MISSION_LIDAR_REACHED_M:
+    if (bearing is not None and abs(bearing) < MISSION_MARK_BEARING_RAD
+            and exploration._get_lidar_front_min_dist(angle_range_deg=15) < MISSION_MARK_LASER_M):
         return True
     return False
 
 
-def _detect_and_mark(colors=None):
-    """Record/refine each visible column's world position in perception memory.
-
-    A column's memory being set is the FSM's "localized" signal (seek phases stop
-    exploring once the ACTIVE color has a memory).  Memory is only written when the
-    sighting has a finite distance estimate, so a memorized position is trustworthy
-    enough to navigate toward.  Prints once per column on first sighting.
+def _perceive(colors=None):
+    """Per-tick perception for the mission.  For each visible column:
+      * update perception memory with its projected world position (used to
+        navigate toward it — a distant sighting is enough for this), and
+      * once CONFIRMED at the pillar (_within_mark_dist), stamp its cell on the
+        map in its colour and flag it registered/visited (the mark gate).
     """
     if colors is None:
         colors = sensors.read_color_detections()
@@ -112,12 +124,23 @@ def _detect_and_mark(colors=None):
         dist = colors.get(f"{color}_distance_m", float("inf"))
         if bearing is None or not math.isfinite(dist):
             continue
-        # Refine the remembered world position on every sighting.
+        # Localize (for navigation direction) on every sighting, any distance.
         perception.update_target_memory(color, pose, bearing, dist)
         if not _seen[color]:
-            print(f"[MISSION] {color} column seen "
-                  f"(dist={dist:.2f} m, ratio={colors.get(f'{color}_ratio', 0):.3f})")
+            print(f"[MISSION] {color} column spotted (dist~{dist:.2f} m) — approaching to confirm")
             _seen[color] = True
+        # Register + colour-stamp only once CONFIRMED at the pillar.
+        if _within_mark_dist(color, colors) and not _registered[color]:
+            # Stamp at the reliable close range (front laser, clamped), directly
+            # ahead — the pillar is centred at this moment — NOT the bad depth dist.
+            fd = exploration._get_lidar_front_min_dist(angle_range_deg=15)
+            stamp_d = fd if math.isfinite(fd) and fd <= MISSION_MARK_MAX_STAMP_M else MISSION_MARK_MAX_STAMP_M
+            world = perception.target_world_position(pose, bearing, stamp_d)
+            if world is not None:
+                mapping.mark_pillar(mapping.world_to_map(world[0], world[1]), color)
+            _registered[color] = True
+            print(f"[MISSION] {color} pillar reached & marked on map "
+                  f"(laser={fd:.2f} m, ratio={colors.get(f'{color}_ratio', 0):.3f})")
 
 
 # ── Final drive helpers ───────────────────────────────────────────────────────
@@ -162,7 +185,8 @@ def _drive_to(color, should_continue):
     """Drive to the remembered `color` pillar: known-free A* to a stand-off cell
     in front of it + DWA following, continuously re-planning toward the (refined)
     remembered position after each finished path or recovery.  Returns True once
-    the pillar is actually reached (_column_close), False if aborted/unreachable.
+    the pillar is CONFIRMED within the registration distance (_within_mark_dist),
+    False if aborted/unreachable.
     """
     replans = 0
     while should_continue():
@@ -173,8 +197,10 @@ def _drive_to(color, should_continue):
         goal_cell = _approach_cell(localization.get_pose(), world)
         route = planning.plan(tuple(exploration._get_map_position()), goal_cell)
         if not route or len(route) < 2:
-            # Can't plan a path -- if we're already right on the pillar, that's a win.
-            if _column_close(color, sensors.read_color_detections()):
+            # Can't plan a path -- if we're already confirmed at the pillar, win.
+            colors = sensors.read_color_detections()
+            _perceive(colors)
+            if _within_mark_dist(color, colors):
                 exploration._stop_motor()
                 return True
             return False
@@ -191,10 +217,25 @@ def _drive_to(color, should_continue):
                     return False
 
                 colors = sensors.read_color_detections()
-                _detect_and_mark(colors)                 # keep refining BOTH memories
-                if _column_close(color, colors):         # actually at the pillar
+                _perceive(colors)                        # localize + register both pillars
+                if _within_mark_dist(color, colors):     # confirmed within mark distance
                     exploration._stop_motor()
                     return True
+
+                # ── Reactive visual approach (autonomous.py seek) ──────────────
+                # When the pillar is IN SIGHT, drive straight at it (centre the
+                # bearing, then creep forward) instead of following the A* path to
+                # the depth-estimated cell.  Line-of-sight so it reliably closes
+                # the final gap and marks — this is what stops the earlier
+                # "drive -> not reached -> re-explore" loop.  A* below still runs
+                # when the pillar is NOT visible (to bring it into view).
+                bearing = colors.get(f"{color}_bearing_rad")
+                if colors.get(color) and bearing is not None and not exploration._obstacle_in_front():
+                    if abs(bearing) > SEEK_BEARING_DEADBAND_RAD:
+                        motion.drive_twist(0.0, math.copysign(SEEK_OMEGA, bearing))
+                    else:
+                        motion.drive_twist(SEEK_LIN_VEL, 0.0)
+                    continue
 
                 if exploration._obstacle_in_front():
                     exploration._recover_from_obstacle()
@@ -232,9 +273,9 @@ def _seek_and_reach(color, should_continue):
         # ── Localize the active pillar if we haven't seen it yet ──────────────
         if perception.get_target_memory(color) is None:
             def _hook():
-                _detect_and_mark()                        # marks whatever is visible
+                _perceive()                               # localize + register whatever is visible
                 if perception.get_target_memory(color) is not None:
-                    return False                          # active pillar seen -> stop exploring
+                    return False                          # active pillar spotted -> stop exploring
                 return should_continue()
 
             print(f"[MISSION] exploring to find {color} pillar...")

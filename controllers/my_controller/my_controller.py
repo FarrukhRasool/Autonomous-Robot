@@ -58,6 +58,13 @@ OVERHEAD_SIDE_WARN_DIST = 0.40
 OVERHEAD_SLOW_VEL = 0.04
 OVERHEAD_STEER_OMEGA = 0.12
 
+# The E/X start key is held for many sim steps and Webots AUTO-REPEATS it with
+# 1-tick gaps.  A blocking mode (explore/mission) must only arm its stop-listener
+# after the start key has been RELEASED for this many consecutive ticks, so an
+# auto-repeat gap can't arm it early (which would let the next repeat self-cancel
+# the mode).  ~10 ticks (~0.3 s) is well above the auto-repeat gap.
+KEY_ARM_RELEASE_TICKS = 10
+
 
 # Start the background SLAM mapping thread (folds lidar scans into the map at
 # ~10 Hz off the control loop; localization feeds it motion deltas every step).
@@ -235,16 +242,22 @@ while devices.robot.step(devices.timestep) != -1:
         auto_mode = False
         following.reset()
         reset_autonomous_state()
+        # Fresh SLAM + map + pose for this run — mirrors the reference, where every
+        # `main()` builds a brand-new MyRobot() (empty SlamSystem, empty grid, pose
+        # at origin).  Prevents the pose graph accumulating across runs (which grows
+        # loop-closure cost every session -> progressive slowdown).
+        localization.reset_pose()
+        mapping.clear()
 
-        # `armed` guards against the E press that STARTED exploration (still held
-        # for a few sim steps) immediately cancelling it: only listen for a stop
-        # key AFTER E/Space has first been released.
-        explore_stop = {"armed": False}
+        # Arm the stop-listener only after E/Space has been released for a
+        # sustained run of ticks (KEY_ARM_RELEASE_TICKS), so the held/auto-repeated
+        # start key can't arm it early and then self-cancel exploration.
+        explore_stop = {"armed": False, "release": 0}
         _STOP_KEYS = {ord('E'), ord('e'), ord(' ')}
 
         def _explore_should_continue():
             # Polled every sim tick inside exploration: refresh the live map and
-            # stop on a FRESH E/Space press (edge, not the held start key).
+            # stop on a FRESH E/Space press (once armed).
             if viz_on:
                 visualizer.render(
                     mapping.get_grid(),
@@ -257,12 +270,13 @@ while devices.robot.step(devices.timestep) != -1:
             while kk != -1:
                 keys.add(kk)
                 kk = devices.keyboard.getKey()
+            stop_pressed = bool(keys & _STOP_KEYS)
             if not explore_stop["armed"]:
-                # Wait for the start key to be released before honouring a stop.
-                if not (keys & _STOP_KEYS):
+                explore_stop["release"] = 0 if stop_pressed else explore_stop["release"] + 1
+                if explore_stop["release"] >= KEY_ARM_RELEASE_TICKS:
                     explore_stop["armed"] = True
                 return True
-            return not (keys & _STOP_KEYS)
+            return not stop_pressed
 
         print("Explore mode ON — frontier exploration (E/Space to stop)")
         exploration.run(_explore_should_continue)
@@ -277,8 +291,12 @@ while devices.robot.step(devices.timestep) != -1:
         auto_mode = False
         following.reset()
         reset_autonomous_state()
+        # Fresh SLAM + map + pose for this run (see E handler) — every mission
+        # starts clean, exactly like the reference's per-process MyRobot().
+        localization.reset_pose()
+        mapping.clear()
 
-        mission_stop = {"armed": False}
+        mission_stop = {"armed": False, "release": 0}
         _MSTOP_KEYS = {ord('X'), ord('x'), ord(' ')}
 
         def _mission_should_continue():
@@ -298,11 +316,13 @@ while devices.robot.step(devices.timestep) != -1:
             while kk != -1:
                 keys.add(kk)
                 kk = devices.keyboard.getKey()
+            stop_pressed = bool(keys & _MSTOP_KEYS)
             if not mission_stop["armed"]:
-                if not (keys & _MSTOP_KEYS):
+                mission_stop["release"] = 0 if stop_pressed else mission_stop["release"] + 1
+                if mission_stop["release"] >= KEY_ARM_RELEASE_TICKS:
                     mission_stop["armed"] = True
                 return True
-            return not (keys & _MSTOP_KEYS)
+            return not stop_pressed
 
         print("Mission ON — blue-then-yellow (X/Space to stop)")
         mission.run(_mission_should_continue)
