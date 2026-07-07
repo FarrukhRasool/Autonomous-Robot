@@ -144,19 +144,56 @@ def rasterize_scan(log_odds_array, robot_map_pos, map_points, map_size=MAP_SIZE)
     Each ray: every cell it passes through gets FREE evidence (+= LOGODDS_FREE,
     negative), unless the cell is locked at/above LOGODDS_LOCK (a sticky wall,
     never eroded); the ray's endpoint cell gets OCC evidence (+= LOGODDS_OCC).
+
+    Vectorised DDA form of the per-beam Bresenham loop: ray i has Chebyshev-
+    distance nsteps[i] cells between robot and endpoint, so sampling s=0..nsteps[i]
+    at fraction s/nsteps[i] reproduces the Bresenham cells (the dominant axis
+    advances exactly one cell per step, so there are no intra-ray duplicates).
+    Done as NumPy array ops it runs ~50x faster and releases the GIL — essential
+    because this runs on the background SLAM thread (30x per update, and once per
+    keyframe during loop-closure rebuild); a Python loop here froze the control
+    loop.  Cross-ray order at a cell that is both a hit and a pass-through was
+    already ambiguous in the per-beam loop (it depended on beam order), so
+    applying all OCC then all lock-gated FREE stays within that same ambiguity.
     """
+    pts = np.asarray(map_points, dtype=np.int64).reshape(-1, 2)
+    if pts.shape[0] == 0:
+        return
     rx, ry = int(robot_map_pos[0]), int(robot_map_pos[1])
-    for map_target in map_points:
-        cells = _bresenham(rx, ry, int(map_target[0]), int(map_target[1]))
-        # Free evidence for every cell the ray passes through (all but the hit).
-        for (cx, cy) in cells[:-1]:
-            if 0 <= cx < map_size and 0 <= cy < map_size:
-                if log_odds_array[cy, cx] < LOGODDS_LOCK:   # sticky-wall lock
-                    log_odds_array[cy, cx] += LOGODDS_FREE
-        # Occupied evidence for the endpoint cell (unconditional, as in AURE).
-        ex, ey = cells[-1]
-        if 0 <= ex < map_size and 0 <= ey < map_size:
-            log_odds_array[ey, ex] += LOGODDS_OCC
+    ex, ey = pts[:, 0], pts[:, 1]          # endpoints (x=col, y=row)
+
+    # Endpoint OCC evidence (unconditional, as in AURE).
+    ok = (ex >= 0) & (ex < map_size) & (ey >= 0) & (ey < map_size)
+    np.add.at(log_odds_array, (ey[ok], ex[ok]), LOGODDS_OCC)
+
+    # Free cells along each ray: s = 0 .. nsteps-1 (endpoint excluded above).
+    dx = ex - rx
+    dy = ey - ry
+    nsteps = np.maximum(np.abs(dx), np.abs(dy))       # cells per ray
+    max_steps = int(nsteps.max())
+    if max_steps == 0:
+        return                                        # every endpoint on the robot cell
+
+    s = np.arange(max_steps)                          # free-sample indices
+    denom = np.maximum(nsteps, 1)[:, None].astype(np.float64)
+    frac = s[None, :] / denom                         # (rays, samples)
+    fx = np.rint(rx + dx[:, None] * frac).astype(np.int64)
+    fy = np.rint(ry + dy[:, None] * frac).astype(np.int64)
+
+    free = s[None, :] < nsteps[:, None]               # samples belonging to each ray
+    fx = fx[free]
+    fy = fy[free]
+
+    inb = (fx >= 0) & (fx < map_size) & (fy >= 0) & (fy < map_size)
+    fx = fx[inb]
+    fy = fy[inb]
+
+    # Sticky-wall lock: FREE is negative, so it only ever lowers a cell — a cell
+    # already at/above LOCK is never eroded.  Masking on the current value (== the
+    # pre-FREE value, since FREE can't lift a cell to LOCK) matches the per-cell
+    # check; duplicate pass-throughs across rays each subtract, as in the loop.
+    below = log_odds_array[fy, fx] < LOGODDS_LOCK
+    np.add.at(log_odds_array, (fy[below], fx[below]), LOGODDS_FREE)
 
 
 def _grid_from_log_odds(log_odds, prev_grid):

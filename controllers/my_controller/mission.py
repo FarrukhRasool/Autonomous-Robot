@@ -44,6 +44,7 @@ from config import (
     GREEN_MARK_ENABLED, SLAM_GREEN_PERIOD_STEPS,
     FOLLOW_WAYPOINT_STRIDE,
     SEEK_LIN_VEL, SEEK_OMEGA, SEEK_BEARING_DEADBAND_RAD,
+    PILLAR_COMMIT_DIST_M,
 )
 
 SEEKING_BLUE, SEEKING_YELLOW, DONE = 0, 1, 2
@@ -59,15 +60,23 @@ _seen = {"blue": False, "yellow": False}
 _registered = {"blue": False, "yellow": False}
 _state = SEEKING_BLUE
 _tick_count = 0
+_current_route = None   # the live A* route being driven (for the map overlay)
 
 
 def reset():
-    global _seen, _registered, _state, _tick_count
+    global _seen, _registered, _state, _tick_count, _current_route
     _seen = {"blue": False, "yellow": False}
     _registered = {"blue": False, "yellow": False}
     _state = SEEKING_BLUE
     _tick_count = 0
+    _current_route = None
     perception.reset_target_memory()
+
+
+def current_path():
+    """The complete route the mission is currently driving (list of (x, y) map
+    cells), e.g. the blue->yellow traceback path — for the live-map overlay."""
+    return _current_route
 
 
 def state_name():
@@ -143,6 +152,26 @@ def _perceive(colors=None):
                   f"(laser={fd:.2f} m, ratio={colors.get(f'{color}_ratio', 0):.3f})")
 
 
+# ── Commit gate: biased-explore -> final-drive handoff ────────────────────────
+
+def _close_to_mem(color):
+    """True if the robot is within PILLAR_COMMIT_DIST_M of the remembered pillar."""
+    mem = perception.get_target_memory(color)
+    if mem is None:
+        return False
+    px, py = localization.get_position()
+    return math.hypot(mem[0] - px, mem[1] - py) <= PILLAR_COMMIT_DIST_M
+
+
+def _should_commit(color, colors):
+    """Stop biased exploration and hand off to the precise final drive once the
+    pillar is confirmed at contact range OR the robot is within the commit
+    distance of the remembered sighting.  Approaching under bias first (rather
+    than committing from a far, depth-noisy glimpse) avoids arrive-at-wrong-spot
+    retries."""
+    return _within_mark_dist(color, colors) or _close_to_mem(color)
+
+
 # ── Final drive helpers ───────────────────────────────────────────────────────
 
 def _approach_cell(pose, world):
@@ -188,6 +217,7 @@ def _drive_to(color, should_continue):
     the pillar is CONFIRMED within the registration distance (_within_mark_dist),
     False if aborted/unreachable.
     """
+    global _current_route
     replans = 0
     while should_continue():
         world = perception.get_target_memory(color)
@@ -206,6 +236,7 @@ def _drive_to(color, should_continue):
             return False
 
         current_path = list(route)
+        _current_route = current_path        # expose the full route for the live map
         target_index = FOLLOW_WAYPOINT_STRIDE
         need_replan = False
 
@@ -270,19 +301,29 @@ def _seek_and_reach(color, should_continue):
     """
     attempts = 0
     while should_continue():
-        # ── Localize the active pillar if we haven't seen it yet ──────────────
+        # ── If the pillar's location is UNKNOWN, explore to find it ───────────
+        # (biased toward it once sighted; a sighting steers exploration but does
+        # NOT stop it — only the commit distance / contact range does).  If we
+        # ALREADY know where it is (e.g. yellow spotted while seeking blue), skip
+        # exploration entirely and go straight to the direct traceback drive,
+        # which plans and follows the full blue->yellow path.
         if perception.get_target_memory(color) is None:
             def _hook():
-                _perceive()                               # localize + register whatever is visible
-                if perception.get_target_memory(color) is not None:
-                    return False                          # active pillar spotted -> stop exploring
+                colors = sensors.read_color_detections()
+                _perceive(colors)                         # localize + register whatever is visible
+                mem = perception.get_target_memory(color)
+                if mem is not None:
+                    exploration.set_target_bias(mem)      # steer exploration toward the active pillar
+                    if _should_commit(color, colors):
+                        return False                      # close/confirmed -> hand off to the drive
                 return should_continue()
 
             print(f"[MISSION] exploring to find {color} pillar...")
             exploration.reset()
             exploration.run(_hook)
+            exploration.clear_target_bias()
             if perception.get_target_memory(color) is None:
-                return False                              # aborted before seeing it
+                return False                              # aborted before ever seeing it
 
         # ── Drive to it ───────────────────────────────────────────────────────
         print(f"[MISSION] {color} localized -> driving to it...")
