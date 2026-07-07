@@ -22,9 +22,10 @@ from scipy.interpolate import splprep, splev
 
 import mapping
 from config import (
-    CELL_FREE, CELL_OCC, CELL_CLOSED, CELL_GREEN,
+    CELL_FREE, CELL_OCC, CELL_CLOSED, CELL_GREEN, CELL_UNKNOWN,
     ASTAR_INFLATION_LEVELS, ASTAR_EXPANSION_PIXELS, PATH_MIN_LENGTH_M,
     ASTAR_SAFE_DISTANCE_PX, ASTAR_PENALTY_STRENGTH, ASTAR_HEURISTIC_WEIGHT,
+    PLAN_BLOCK_UNKNOWN, ASTAR_FRONTIER_INFLATION,
 )
 
 
@@ -181,25 +182,34 @@ def _path_length_m(path):
     return total
 
 
-def plan(start_cell, goal_cell, grid=None):
+def plan(start_cell, goal_cell, grid=None, block_unknown=None, inflation_levels=None):
     """Plan a route from start_cell to goal_cell (both (x, y) map cells).
 
-    Escalating inflation (ASTAR_INFLATION_LEVELS): prefer the safest/widest
-    clearance that yields a path of at least PATH_MIN_LENGTH_M; otherwise return
-    the longest candidate found.  Returns a spline-smoothed [(x, y), ...] path,
-    or [] if unreachable at every inflation level.
+    Escalating inflation (inflation_levels): prefer the safest/widest clearance
+    that yields a path of at least PATH_MIN_LENGTH_M; otherwise return the longest
+    candidate found.  Returns a spline-smoothed [(x, y), ...] path, or [] if
+    unreachable at every inflation level.
+
+    block_unknown : None -> use PLAN_BLOCK_UNKNOWN (final goal-run: refuse UNKNOWN
+    so a path can never enter unmapped space).  Pass False for frontier-chasing,
+    where routing THROUGH unknown to reach the boundary is the whole point.
     """
     if grid is None:
         grid = mapping.get_grid()
+    if block_unknown is None:
+        block_unknown = PLAN_BLOCK_UNKNOWN
+    if inflation_levels is None:
+        inflation_levels = ASTAR_INFLATION_LEVELS
     base = grid.copy()
 
     best_path = []
     best_len = 0.0
 
-    for inflation in ASTAR_INFLATION_LEVELS:
+    for inflation in inflation_levels:
         work = base.astype(np.int32)
         closed_mask = (work == CELL_CLOSED)
         green_mask = (work == CELL_GREEN)
+        unknown_mask = (work == CELL_UNKNOWN)
 
         # Don't inflate closures/green: closures free during inflation, green hard.
         work[closed_mask] = CELL_FREE
@@ -212,6 +222,11 @@ def plan(start_cell, goal_cell, grid=None):
         # Re-apply closures/green as hard obstacles after inflation.
         work[closed_mask] = CELL_OCC
         work[green_mask] = CELL_OCC
+
+        # Only route through mapped-free space: block UNKNOWN so a path can never
+        # run into an unmapped wall (endpoint disks below still free start/goal).
+        if block_unknown:
+            work[unknown_mask] = CELL_OCC
 
         _expand_free_disk(work, goal_cell, ASTAR_EXPANSION_PIXELS)
         _expand_free_disk(work, start_cell, ASTAR_EXPANSION_PIXELS)
@@ -228,3 +243,14 @@ def plan(start_cell, goal_cell, grid=None):
             best_path = path
 
     return best_path
+
+
+def plan_frontier(start_cell, goal_cell, grid=None):
+    """Exploration planner (ports the reference project's find_path_for_frontier).
+
+    Routes at a single inflation level (ASTAR_FRONTIER_INFLATION) and ALLOWS
+    UNKNOWN space — entering the unknown to reach the frontier boundary is the
+    point of exploration, unlike the final goal-run which refuses unknown.
+    """
+    return plan(start_cell, goal_cell, grid=grid,
+                block_unknown=False, inflation_levels=[ASTAR_FRONTIER_INFLATION])

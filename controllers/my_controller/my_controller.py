@@ -20,15 +20,15 @@ import planning
 import following
 import exploration
 import mission
-import safety
+import slam
 import visualizer
 from autonomous import autonomous_step, reset_autonomous_state, reset_mission_state
 from sensor_debug import format_compact_sensors, format_sensor_snapshot
 from config import (
     TARGET_LIN_VEL, TARGET_ANG_VEL, FRONT_STOP_DIST,
     POSE_LOG_PERIOD_STEPS,
-    MAP_UPDATE_PERIOD_STEPS, MAP_UPDATE_MAX_OMEGA,
-    VIZ_PERIOD_STEPS, GREEN_MARK_ENABLED,
+    SLAM_GREEN_PERIOD_STEPS,
+    VIZ_PERIOD_STEPS, GREEN_MARK_ENABLED, FOLLOW_MAX_RETRIES,
 )
 
 # ── Controller state ───────────────────────────────────────────────────────────
@@ -38,14 +38,11 @@ test_timer       = 0
 sensor_log       = False
 auto_mode        = False
 block_timer      = 0
-prev_omega       = 0.0   # last step's applied yaw rate — gates mapping while turning
-prev_blocked     = False # last step hit a wall-block/reverse — pose unreliable, pause mapping
 plan_targets     = []    # up to 2 goal cells captured by B; V plans between them
 last_route       = None  # most recently planned path, shown in the live view
 viz_on           = False # live cv2 map window toggle (C key)
 follow_mode      = False # DWA path-follow mode toggle (Y key)
-explore_mode     = False # frontier exploration mode toggle (E key)
-mission_mode     = False # blue-then-yellow mission toggle (X key)
+follow_retries   = 0     # replan-on-stuck counter for manual Follow
 
 print(
     "Controller ready.  Keys: F/S/A/D drive | Space stop | T self-test | "
@@ -61,6 +58,18 @@ OVERHEAD_SIDE_WARN_DIST = 0.40
 OVERHEAD_SLOW_VEL = 0.04
 OVERHEAD_STEER_OMEGA = 0.12
 
+# The E/X start key is held for many sim steps and Webots AUTO-REPEATS it with
+# 1-tick gaps.  A blocking mode (explore/mission) must only arm its stop-listener
+# after the start key has been RELEASED for this many consecutive ticks, so an
+# auto-repeat gap can't arm it early (which would let the next repeat self-cancel
+# the mode).  ~10 ticks (~0.3 s) is well above the auto-repeat gap.
+KEY_ARM_RELEASE_TICKS = 10
+
+
+# Start the background SLAM mapping thread (folds lidar scans into the map at
+# ~10 Hz off the control loop; localization feeds it motion deltas every step).
+slam.start_mapping_thread(sensors.read_lidar_pointcloud_2d, motion.is_turning)
+
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
 while devices.robot.step(devices.timestep) != -1:
@@ -72,26 +81,20 @@ while devices.robot.step(devices.timestep) != -1:
     gyro_z              = sensors.read_gyro_z()
     localization.update_from_encoders(left_rad, right_rad, imu_yaw, gyro_z)
 
-    # ── Mapping update (AURE log-odds occupancy from lidar point cloud) ────────
-    # Throttled to bound per-step cost, and skipped while turning fast (rotation
-    # smears the scan) — a single-loop analog of AURE's "update when not turning"
-    # background mapper.  prev_omega is last step's applied yaw rate.
-    robot_x, robot_y, robot_theta = localization.get_pose()
-    # The robot is physically here -> its footprint is free.  Runs every step and
-    # repairs any phantom walls left by odometry slip while wedged.
-    mapping.mark_robot_free((robot_x, robot_y, robot_theta))
+    # ── Pose + green marking ───────────────────────────────────────────────────
+    # SLAM runs on its own background thread (started before this loop): it folds
+    # lidar scans into the map (slam.observe) at ~10 Hz and localization feeds it
+    # motion deltas via slam.predict every step.  This loop only reads the pose
+    # and stamps green ground (camera-based, so it stays on the main thread; the
+    # grid write is done under mapping.LOCK inside mark_green).
+    robot_x, robot_y, robot_theta = localization.get_pose()   # SLAM estimate
     if (not reset_this_step
-            and step_count % MAP_UPDATE_PERIOD_STEPS == 0
-            and abs(prev_omega) < MAP_UPDATE_MAX_OMEGA
-            and not prev_blocked):        # skip while wedged/escaping (pose unreliable)
-        cloud = sensors.read_lidar_pointcloud_2d()
-        if len(cloud) > 0:
-            mapping.lidar_update((robot_x, robot_y, robot_theta), cloud)
-        # Stamp detected green ground as forbidden so planning/DWA avoid it.
-        if GREEN_MARK_ENABLED:
-            green_pts = sensors.green_ground_points_body()
-            if len(green_pts) > 0:
-                mapping.mark_green((robot_x, robot_y, robot_theta), green_pts)
+            and GREEN_MARK_ENABLED
+            and step_count % SLAM_GREEN_PERIOD_STEPS == 0
+            and not motion.is_turning()):
+        green_pts = sensors.green_ground_points_body()
+        if len(green_pts) > 0:
+            mapping.mark_green((robot_x, robot_y, robot_theta), green_pts)
 
     # Keyboard edge detection: new_keys fires only on the step a key first appears
     pressed_now = set()
@@ -104,7 +107,6 @@ while devices.robot.step(devices.timestep) != -1:
     v_cmd     = 0.0
     omega_cmd = 0.0
     sel_label = ''
-    safe_label = ''   # set by safety.apply in autonomous modes; drives the mapping pause
 
     # ── One-shot key actions ───────────────────────────────────────────────────
     if ord('I') in new_keys or ord('i') in new_keys:
@@ -123,12 +125,10 @@ while devices.robot.step(devices.timestep) != -1:
         reset_autonomous_state()
         reset_mission_state()
         perception.reset_target_memory()
-        # Clear planning/following/exploration/mission debug state too.
+        # Clear planning/following debug state too.
         plan_targets = []
         last_route = None
         follow_mode = False
-        explore_mode = False
-        mission_mode = False
         following.reset()
         exploration.reset()
         mission.reset()
@@ -138,8 +138,7 @@ while devices.robot.step(devices.timestep) != -1:
     if ord('M') in new_keys or ord('m') in new_keys:
         rx, ry, _ = localization.get_pose()
         print(mapping.summary(robot_xy=(rx, ry)))
-        _pc = mission.pillar_cells()
-        print(f"[MAP] saved {mapping.save_png('map.png', blue_cell=_pc['blue'], yellow_cell=_pc['yellow'])}")
+        print(f"[MAP] saved {mapping.save_png('map.png')}")
 
     if ord('B') in new_keys or ord('b') in new_keys:
         if len(plan_targets) >= 2:
@@ -167,9 +166,7 @@ while devices.robot.step(devices.timestep) != -1:
                     cw = mapping.map_to_world(*c)
                     length_m += math.hypot(cw[0] - pw[0], cw[1] - pw[1])
                     pw = cw
-                _pc = mission.pillar_cells()
-                saved = mapping.save_png('path.png', path_cells=route,
-                                         blue_cell=_pc['blue'], yellow_cell=_pc['yellow'])
+                saved = mapping.save_png('path.png', path_cells=route)
                 print(f"[PLAN] {start_cell} -> {goal_cell}: {len(route)} waypoints, "
                       f"{length_m:.2f} m; saved {saved}")
             else:
@@ -216,42 +213,126 @@ while devices.robot.step(devices.timestep) != -1:
     if ord('Y') in new_keys or ord('y') in new_keys:
         follow_mode = not follow_mode
         if follow_mode:
-            explore_mode = False           # mutually exclusive with explore
-            if last_route:
-                following.set_path(last_route)
-                print(f"Follow mode ON — driving {len(last_route)}-waypoint path (DWA)")
-            else:
+            goal_cell = plan_targets[-1] if plan_targets else None
+            if goal_cell is None:
                 follow_mode = False
-                print("Follow mode: no planned path — press V to plan one first")
+                print("Follow mode: no goal — press B at the target first")
+            else:
+                # Always plan from the robot's CURRENT cell to the goal, so the
+                # path starts where the robot is (no navigating to a distant A).
+                start_cell = mapping.robot_map_pos(localization.get_pose())
+                route = planning.plan(start_cell, goal_cell)
+                if route:
+                    last_route = route
+                    following.set_path(route)
+                    follow_retries = 0
+                    print(f"Follow mode ON — driving {len(route)}-waypoint path "
+                          f"robot->goal (DWA)")
+                else:
+                    follow_mode = False
+                    print(f"Follow mode: no path from robot to goal {goal_cell}")
         else:
             following.reset()
             print("Follow mode OFF")
 
-    # ── E: autonomous frontier exploration ────────────────────────────────────
+    # ── E: frontier exploration (faithful blocking port of the reference).
+    #     Runs its own sim-step loop until E or Space is pressed again. ─────────
     if ord('E') in new_keys or ord('e') in new_keys:
-        explore_mode = not explore_mode
-        if explore_mode:
-            follow_mode = False
-            auto_mode = False
-            mission_mode = False
-            exploration.reset()
-            print("Explore mode ON — frontier exploration (DWA)")
-        else:
-            exploration.reset()
-            print("Explore mode OFF")
+        follow_mode = False
+        auto_mode = False
+        following.reset()
+        reset_autonomous_state()
+        # Fresh SLAM + map + pose for this run — mirrors the reference, where every
+        # `main()` builds a brand-new MyRobot() (empty SlamSystem, empty grid, pose
+        # at origin).  Prevents the pose graph accumulating across runs (which grows
+        # loop-closure cost every session -> progressive slowdown).
+        localization.reset_pose()
+        mapping.clear()
 
-    # ── X: full blue-then-yellow mission ──────────────────────────────────────
+        # Arm the stop-listener only after E/Space has been released for a
+        # sustained run of ticks (KEY_ARM_RELEASE_TICKS), so the held/auto-repeated
+        # start key can't arm it early and then self-cancel exploration.
+        explore_stop = {"armed": False, "release": 0}
+        _STOP_KEYS = {ord('E'), ord('e'), ord(' ')}
+
+        def _explore_should_continue():
+            # Polled every sim tick inside exploration: refresh the live map and
+            # stop on a FRESH E/Space press (once armed).
+            if viz_on:
+                visualizer.render(
+                    mapping.get_grid(),
+                    robot_cell=mapping.robot_map_pos(localization.get_pose()),
+                    goals=[exploration.current_goal()] if exploration.current_goal() else [],
+                    path=exploration.current_path(),
+                )
+            keys = set()
+            kk = devices.keyboard.getKey()
+            while kk != -1:
+                keys.add(kk)
+                kk = devices.keyboard.getKey()
+            stop_pressed = bool(keys & _STOP_KEYS)
+            if not explore_stop["armed"]:
+                explore_stop["release"] = 0 if stop_pressed else explore_stop["release"] + 1
+                if explore_stop["release"] >= KEY_ARM_RELEASE_TICKS:
+                    explore_stop["armed"] = True
+                return True
+            return not stop_pressed
+
+        print("Explore mode ON — frontier exploration (E/Space to stop)")
+        exploration.run(_explore_should_continue)
+        motion.stop_robot()
+        v_cmd = omega_cmd = 0.0
+        print("Explore mode OFF")
+
+    # ── X: blue-then-yellow mission (FR5) — faithful blocking port. ────────────
+    #     Explores to find both columns, then drives blue->yellow. ──────────────
     if ord('X') in new_keys or ord('x') in new_keys:
-        mission_mode = not mission_mode
-        if mission_mode:
-            explore_mode = False
-            follow_mode = False
-            auto_mode = False
-            mission.reset()
-            print("Mission mode ON — reach BLUE then YELLOW")
-        else:
-            mission.reset()
-            print("Mission mode OFF")
+        follow_mode = False
+        auto_mode = False
+        following.reset()
+        reset_autonomous_state()
+        # Fresh SLAM + map + pose for this run (see E handler) — every mission
+        # starts clean, exactly like the reference's per-process MyRobot().
+        localization.reset_pose()
+        mapping.clear()
+
+        mission_stop = {"armed": False, "release": 0}
+        _MSTOP_KEYS = {ord('X'), ord('x'), ord(' ')}
+
+        def _mission_should_continue():
+            if viz_on:
+                pcs = mission.pillar_cells()
+                goal = exploration.current_goal()
+                visualizer.render(
+                    mapping.get_grid(),
+                    robot_cell=mapping.robot_map_pos(localization.get_pose()),
+                    goals=[goal] if goal is not None else [],
+                    # Prefer the mission's full drive route (e.g. blue->yellow) so
+                    # the complete planned path is shown; fall back to follow/explore.
+                    path=(mission.current_path()
+                          or following.current_path()
+                          or exploration.current_path()),
+                    blue_cell=pcs["blue"],
+                    yellow_cell=pcs["yellow"],
+                )
+            keys = set()
+            kk = devices.keyboard.getKey()
+            while kk != -1:
+                keys.add(kk)
+                kk = devices.keyboard.getKey()
+            stop_pressed = bool(keys & _MSTOP_KEYS)
+            if not mission_stop["armed"]:
+                mission_stop["release"] = 0 if stop_pressed else mission_stop["release"] + 1
+                if mission_stop["release"] >= KEY_ARM_RELEASE_TICKS:
+                    mission_stop["armed"] = True
+                return True
+            return not stop_pressed
+
+        print("Mission ON — blue-then-yellow (X/Space to stop)")
+        mission.run(_mission_should_continue)
+        motion.stop_robot()
+        v_cmd = omega_cmd = 0.0
+        print("Mission OFF")
 
     # ── Hard stop: Space exits autonomous/follow mode and zeroes twist ────────
     if ord(' ') in new_keys:
@@ -265,60 +346,39 @@ while devices.robot.step(devices.timestep) != -1:
             follow_mode = False
             following.reset()
             print("Follow mode OFF (Space pressed)")
-        if explore_mode:
-            explore_mode = False
-            exploration.reset()
-            print("Explore mode OFF (Space pressed)")
-        if mission_mode:
-            mission_mode = False
-            mission.reset()
-            print("Mission mode OFF (Space pressed)")
 
-    # ── Mission / explore / follow / autonomous / teleop (mutually exclusive) ──
-    elif mission_mode:
-        colors = sensors.read_color_detections()
-        v_cmd, omega_cmd, m_status, m_dbg = mission.mission_step(
-            (robot_x, robot_y, robot_theta), devices.timestep / 1000.0, colors
-        )
-        v_cmd, omega_cmd, safe_label = safety.apply(v_cmd, omega_cmd, colors=colors)
-        sel_label = f"mission_{m_status}" + (f"|{safe_label}" if safe_label else "")
-        if step_count % 15 == 0:
-            print(f"[MISSION] {mission.state_name()} status={m_status} "
-                  f"active={m_dbg['active']} visible={m_dbg['visible']} "
-                  f"dist={m_dbg['dist'] if m_dbg['dist'] != float('inf') else 'inf'} "
-                  f"safety={safe_label or '-'}")
-        if m_status == "done":
-            mission_mode = False
-            v_cmd = omega_cmd = 0.0
-            print("Mission mode OFF (MISSION COMPLETE — blue then yellow reached)")
-
-    elif explore_mode:
-        v_cmd, omega_cmd, ex_status = exploration.explore_step(
-            (robot_x, robot_y, robot_theta), devices.timestep / 1000.0
-        )
-        v_cmd, omega_cmd, safe_label = safety.apply(v_cmd, omega_cmd)
-        sel_label = f"explore_{ex_status}" + (f"|{safe_label}" if safe_label else "")
-        if step_count % 15 == 0:
-            print(f"[EXPLORE] {ex_status} safety={safe_label or '-'} "
-                  f"v={v_cmd:+.2f} w={omega_cmd:+.2f} goal={exploration.current_goal()} "
-                  f"| {mapping.summary()}")
-        if ex_status == "complete":
-            explore_mode = False
-            exploration.reset()
-            v_cmd = omega_cmd = 0.0
-            print("Explore mode OFF (exploration complete)")
-
+    # ── Follow / autonomous / teleop (mutually exclusive) ─────────────────────
     elif follow_mode:
+        # DWA drives the planned path directly (the planned path is already
+        # collision- and green-free, and DWA rejects obstacle trajectories).
         v_cmd, omega_cmd, follow_status = following.step(
             (robot_x, robot_y, robot_theta), devices.timestep / 1000.0
         )
-        v_cmd, omega_cmd, safe_label = safety.apply(v_cmd, omega_cmd)
-        sel_label = f"follow_{follow_status}" + (f"|{safe_label}" if safe_label else "")
-        if follow_status in ("done", "stuck", "idle"):
+        sel_label = f"follow_{follow_status}"
+        if step_count % 15 == 0:
+            print(f"[FOLLOW] {follow_status} v={v_cmd:+.2f} w={omega_cmd:+.2f} "
+                  f"retries={follow_retries}")
+        if follow_status == "done":
             follow_mode = False
             following.reset()
             v_cmd = omega_cmd = 0.0
-            print(f"Follow mode OFF ({follow_status})")
+            print("Follow mode OFF (done)")
+        elif follow_status in ("stuck", "idle"):
+            # Replan robot->goal against the now-updated map and keep going,
+            # instead of giving up on the first obstacle (like Mission/Explore).
+            goal_cell = plan_targets[-1] if plan_targets else None
+            follow_retries += 1
+            route = (planning.plan(mapping.robot_map_pos((robot_x, robot_y, robot_theta)),
+                                   goal_cell)
+                     if goal_cell is not None and follow_retries <= FOLLOW_MAX_RETRIES else None)
+            if route:
+                following.set_path(route)
+                print(f"[FOLLOW] {follow_status} -> replanned ({len(route)} wp, retry {follow_retries})")
+            else:
+                follow_mode = False
+                following.reset()
+                v_cmd = omega_cmd = 0.0
+                print(f"Follow mode OFF ({follow_status}; retries={follow_retries})")
 
     elif auto_mode:
         v_cmd, omega_cmd, sel_label, block_timer, dbg = autonomous_step(
@@ -361,35 +421,15 @@ while devices.robot.step(devices.timestep) != -1:
 
     # ── Apply twist ────────────────────────────────────────────────────────────
     v_real, omega_real, wL, wR = motion.drive_twist(v_cmd, omega_cmd)
-    prev_omega = omega_real
-    # Pose is unreliable during a wall-block/reverse (wheels may slip) — pause
-    # mapping next step so we don't stamp walls from a drifting pose.
-    prev_blocked = ("block" in safe_label) or ("reverse" in safe_label)
 
     # ── Live map view (inline cv2 window, throttled) ──────────────────────────
     if viz_on and step_count % VIZ_PERIOD_STEPS == 0:
-        # Show the active route (mission/explore/follow) if any, else the last plan.
-        if mission_mode or explore_mode or follow_mode:
-            viz_path = following.current_path()
-        else:
-            viz_path = last_route
-        # Colored pillar markers (mission mode) + the current goal/frontier.
-        viz_blue = viz_yellow = None
-        if mission_mode:
-            _pc = mission.pillar_cells()
-            viz_blue, viz_yellow = _pc["blue"], _pc["yellow"]
-            viz_goals = [mission.current_goal()] if mission.current_goal() is not None else []
-        elif explore_mode and exploration.current_goal() is not None:
-            viz_goals = [exploration.current_goal()]
-        else:
-            viz_goals = plan_targets
+        viz_path = following.current_path() if follow_mode else last_route
         visualizer.render(
             mapping.get_grid(),
             robot_cell=mapping.robot_map_pos((robot_x, robot_y, robot_theta)),
-            goals=viz_goals,
+            goals=plan_targets,
             path=viz_path,
-            blue_cell=viz_blue,
-            yellow_cell=viz_yellow,
         )
 
     # ── Periodic pose log ─────────────────────────────────────────────────────

@@ -26,10 +26,15 @@ Per-step:
 
 import math
 
+import slam
 from kinematics import WHEEL_RADIUS_M, WHEEL_TRACK_M
 from config import SLIP_ENC_ROT_RAD, SLIP_GYRO_RATE_RADS
 
 
+# _x/_y/_theta are now only a raw dead-reckoning trace (diagnostic).  The
+# authoritative pose returned by get_pose()/get_position()/get_heading() is the
+# SLAM estimate (slam.estimated_pose()); this layer's job is to compute the
+# per-step (Δtranslation, Δrotation) motion input and feed it to slam.predict().
 _x = 0.0
 _y = 0.0
 _theta = 0.0
@@ -58,25 +63,25 @@ def reset_pose():
     _prev_left = None
     _prev_right = None
     _imu_yaw_baseline = None
+    slam.reset()          # discard particles/maps; fresh SLAM at (0, 0, 0)
 
 
 def get_pose():
-    """Return the current pose (x_m, y_m, theta_rad)."""
-    return _x, _y, _theta
+    """Return the current SLAM pose estimate (x_m, y_m, theta_rad)."""
+    p = slam.estimated_pose()
+    return float(p[0]), float(p[1]), float(p[2])
 
 
 def get_position():
-    """Return (x_m, y_m) — the translational part of the pose.
-
-    Compatibility accessor for AURE-derived modules (mapping, planning) that
-    consume position and heading separately from the full pose.
-    """
-    return _x, _y
+    """Return (x_m, y_m) — the translational part of the SLAM pose."""
+    p = slam.estimated_pose()
+    return float(p[0]), float(p[1])
 
 
 def get_heading(unit='rad'):
-    """Return the current heading; unit='rad' (default) or 'deg'."""
-    return math.degrees(_theta) if unit == 'deg' else _theta
+    """Return the current SLAM heading; unit='rad' (default) or 'deg'."""
+    theta = float(slam.estimated_pose()[2])
+    return math.degrees(theta) if unit == 'deg' else theta
 
 
 def update_from_encoders(left_rad, right_rad, imu_yaw=None, gyro_z=None):
@@ -106,15 +111,16 @@ def update_from_encoders(left_rad, right_rad, imu_yaw=None, gyro_z=None):
     global _x, _y, _theta, _prev_left, _prev_right, _imu_yaw_baseline
 
     if left_rad is None or right_rad is None:
-        return _x, _y, _theta
+        return get_pose()
 
-    # First-step seeding: capture both encoder and IMU baselines, no integration.
+    # First-step seeding: capture both encoder and IMU baselines, no integration
+    # and no SLAM motion input (pose stays at the SLAM origin).
     if _prev_left is None or _prev_right is None:
         _prev_left = left_rad
         _prev_right = right_rad
         if imu_yaw is not None and _imu_yaw_baseline is None:
             _imu_yaw_baseline = imu_yaw
-        return _x, _y, _theta
+        return get_pose()
 
     # Late IMU baseline capture: covers the case where IMU returned None on
     # the first call but is now available.
@@ -138,28 +144,34 @@ def update_from_encoders(left_rad, right_rad, imu_yaw=None, gyro_z=None):
         d_theta_wheels = (d_right - d_left) / WHEEL_TRACK_M
         theta_new = _wrap_angle(_theta + d_theta_wheels)
 
+    # Per-step heading change — the rotation control input for the SLAM motion model.
+    delta_theta = _wrap_angle(theta_new - _theta)
+
     # ── Rotational wheel-slip gate (ported from AURE update_odometry) ─────────
     # If the encoders claim the robot is rotating but the gyro says the body is
     # not actually turning, the wheels are slipping in place (e.g. one side
-    # pinned against a wall).  Keep the heading (drift-free IMU) but suppress
-    # the phantom position delta so the map isn't corrupted by fake motion.
+    # pinned against a wall).  Keep the heading (drift-free IMU) but suppress the
+    # phantom translation — feed SLAM zero translation, matching the reference's
+    # update_odometry (self.slam.predict(0.0, dtheta)).
     encoder_dtheta = (d_right - d_left) / WHEEL_TRACK_M
     if (gyro_z is not None
             and abs(encoder_dtheta) > SLIP_ENC_ROT_RAD
             and abs(gyro_z) < SLIP_GYRO_RATE_RADS):
         _theta = theta_new
-        return _x, _y, _theta
+        slam.predict(0.0, delta_theta)
+        return get_pose()
 
     # Midpoint heading using the signed shortest delta — robust across the
-    # +pi/-pi wrap boundary.
-    delta_theta = _wrap_angle(theta_new - _theta)
+    # +pi/-pi wrap boundary.  Advance the dead-reckoning trace...
     theta_mid = _wrap_angle(_theta + 0.5 * delta_theta)
-
     _x += d_s * math.cos(theta_mid)
     _y += d_s * math.sin(theta_mid)
     _theta = theta_new
 
-    return _x, _y, _theta
+    # ...and feed the (Δtranslation, Δrotation) motion input to SLAM.
+    slam.predict(d_s, delta_theta)
+
+    return get_pose()
 
 
 def format_pose():
