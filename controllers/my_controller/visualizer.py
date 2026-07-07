@@ -10,7 +10,10 @@ render fails gracefully, prints a one-time notice, and disables itself.
 import numpy as np
 import cv2
 
-from config import CELL_FREE, CELL_OCC, CELL_UNKNOWN, CELL_CLOSED, CELL_GREEN
+from config import (
+    CELL_FREE, CELL_OCC, CELL_UNKNOWN, CELL_CLOSED, CELL_GREEN,
+    CELL_BLUE, CELL_YELLOW,
+)
 
 _WINDOW = "RosBot Map (live)"
 _failed = False   # set True if the OpenCV build cannot open a window (headless)
@@ -39,6 +42,8 @@ def render(grid, robot_cell=None, goals=None, path=None, scale=2,
     img[grid == CELL_UNKNOWN] = (128, 128, 128)
     img[grid == CELL_GREEN] = (0, 200, 0)
     img[grid == CELL_CLOSED] = (128, 0, 128)
+    img[grid == CELL_BLUE] = (255, 0, 0)          # blue pillar (BGR)
+    img[grid == CELL_YELLOW] = (0, 255, 255)      # yellow pillar (BGR)
 
     if scale != 1:
         img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)

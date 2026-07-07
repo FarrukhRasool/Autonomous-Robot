@@ -318,9 +318,9 @@ def read_lidar_pointcloud_2d():
     pts = pts[finite]
     if pts.shape[0] == 0:
         return empty
-    # Full-range point cloud (matches the reference get_pointcloud_2d): SLAM's
-    # scan-matcher uses long-range returns for stronger pose constraints, and it
-    # downsamples the scan itself — so no distance cap is applied here.
+    # Full-range point cloud (matches the reference get_pointcloud_2d): no distance
+    # cap.  With 30 particles the pose is accurate enough that far returns don't
+    # smear; SLAM downsamples the scan (SLAM_SCAN_MAX_BEAMS) itself.
     return pts
 
 
