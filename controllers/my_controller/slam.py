@@ -29,7 +29,7 @@ from config import (
     SLAM_NUM_PARTICLES, SLAM_ALPHA1, SLAM_ALPHA2, SLAM_ALPHA3, SLAM_ALPHA4,
     SLAM_SCAN_MAX_BEAMS, SLAM_RESAMPLE_NEFF_RATIO, SLAM_LIKELIHOOD_SIGMA_M,
     SLAM_REFINE_RADIUS_PX, SLAM_REFINE_WINDOW_DEG, SLAM_REFINE_STEP_DEG,
-    SLAM_OBSERVE_HZ,
+    SLAM_OBSERVE_HZ, LOOP_CLOSURE_COOLDOWN_KEYFRAMES,
 )
 import mapping
 from pose_graph import PoseGraphSLAM, wrap_angle, apply_rigid_correction
@@ -71,6 +71,7 @@ class SlamSystem:
 
         self.pose_graph = PoseGraphSLAM()
         self._estimated_pose = np.array([0.0, 0.0, 0.0])
+        self._last_closure_kf = -LOOP_CLOSURE_COOLDOWN_KEYFRAMES  # allow the first closure freely
 
     # ------------------------------------------------------------------
     # Motion update (called every simulation step)
@@ -223,9 +224,17 @@ class SlamSystem:
         if new_index is None:
             return
 
+        # Cooldown: don't even ATTEMPT a closure (candidate search + correlative
+        # match + optimize + full-map rebuild) until enough keyframes have passed
+        # since the last one.  Without this, co-located keyframes (robot wedged in
+        # one spot) trigger a rebuild every frame -> O(keyframes^2) freeze.
+        if new_index - self._last_closure_kf < LOOP_CLOSURE_COOLDOWN_KEYFRAMES:
+            return
+
         if not self.pose_graph.try_loop_closure(new_index):
             return
 
+        self._last_closure_kf = new_index
         old_last_pose = self.pose_graph.nodes[new_index].copy()
         corrected_poses = self.pose_graph.optimize()
         new_last_pose = corrected_poses[new_index]

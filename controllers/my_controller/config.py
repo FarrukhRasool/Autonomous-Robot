@@ -175,6 +175,14 @@ EXPLORATION_FRONTIER_SELECTION_FREQ = 5   # select a new frontier every N outer 
 EXPLORE_FREESPACE_RADIUS_PX         = 40  # px — random-freespace fallback search radius
 EXPLORE_FREESPACE_TRIES             = 200 # attempts to sample a nearby free cell
 
+# Anti-idle fallback: when NEITHER a frontier NOR a nearby free cell yields a path
+# this iteration, the robot must not just sit there (that starves the map and it
+# never recovers).  Rotate in place to reveal new space, and periodically forget
+# the visited-frontier blacklist so frontiers it gave up on become selectable again.
+EXPLORE_SCAN_TURN_TICKS      = 18   # ticks to rotate in place when no path is available
+EXPLORE_SCAN_TURN_WHEEL      = 4.0  # wheel speed (rad/s) for the in-place reveal rotation
+EXPLORE_FORGET_VISITED_EVERY = 6    # clear the visited blacklist after this many no-path spins
+
 # ── SLAM: FastSLAM 2.0 particle filter (verbatim from the reference CONSTANTS.py) ──
 SLAM_NUM_PARTICLES       = 15    # number of particles (reference uses 30; halved for real-time in
                                  # Webots — observe cost scales linearly with this)
@@ -203,6 +211,12 @@ LOOP_CLOSURE_SEARCH_WINDOW_M   = 0.3    # coarse search window (+/- m) for dx, d
 LOOP_CLOSURE_SEARCH_STEP_M     = 0.033  # step size (1 px) for dx, dy coarse search
 LOOP_CLOSURE_SEARCH_WINDOW_DEG = 20.0   # coarse search window (+/- deg) for dtheta
 LOOP_CLOSURE_SEARCH_STEP_DEG   = 2.0    # step size (deg) for dtheta coarse search
+# Cooldown (NOT in the reference): apply at most one loop closure per this many
+# keyframes.  The full-map rebuild after a closure costs O(keyframes), so firing
+# it every frame — as happens when keyframes pile up in one spot (robot wedged /
+# spinning) — is an O(keyframes^2) runaway that freezes the sim.  A single good
+# closure already corrects the drift; re-closing every frame is wasted work.
+LOOP_CLOSURE_COOLDOWN_KEYFRAMES = 20
 
 # Recovery maneuver when the follower reports "stuck" (wedged against a wall):
 # reverse (if the rear is clear), then turn a fixed spell, then re-select.
@@ -219,7 +233,10 @@ SEEK_LIN_VEL              = 0.20  # m/s   — forward speed when target is centr
 SEEK_OMEGA                = 0.40  # rad/s — yaw rate while orienting toward target
 SEEK_BEARING_DEADBAND_RAD = 0.10  # rad   — |bearing| at or below this counts as centred
 
-# ── Mission ───────────────────────────────────────────────────────────────────
-TARGET_REACHED_DIST_M     = 0.50  # m     — depth-at-centroid below this counts as reached
+# ── Mission (FR5: reach blue, then yellow) ────────────────────────────────────
+TARGET_REACHED_DIST_M     = 0.50  # m     — pillar depth below this counts as reached
 APPROACH_OFFSET_M         = 0.40  # m     — aim this far in front of a pillar (its cell is an obstacle)
 MISSION_REACHED_RATIO     = 0.25  # frame fraction a pillar fills that also counts as reached
+MISSION_MARK_DIST_M       = 1.00  # m     — a visible pillar within this range is "found" (its world
+                                  # position is trusted enough to record and later navigate to)
+MISSION_LIDAR_REACHED_M   = 0.35  # m     — front-lidar range that also counts as "at the pillar"
