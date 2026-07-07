@@ -89,6 +89,7 @@ LOGODDS_FREE = -0.36  # added to cells the ray passes through (free evidence)
 LOGODDS_OCC  = 0.85   # added to the ray's endpoint cell (hit evidence)
 LOGODDS_LOCK = 3.5    # cells at/above this are frozen (sticky walls); free updates skip them
 LOGODDS_CLIP = 5.0    # clamp log-odds to +/- this before the sigmoid
+MAP_LIDAR_MAX_RANGE_M = 3.5  # ignore lidar points beyond this (far rays smear the map)
 
 # Discrete grid thresholds (P = sigmoid(log_odds)):
 P_OCC  = 0.7  # P above this -> OBSTACLE
@@ -100,6 +101,8 @@ CELL_OCC     = 1
 CELL_UNKNOWN = 255
 CELL_CLOSED  = 200  # reserved — closure marking (later milestone)
 CELL_GREEN   = 190  # reserved — green carpet (later milestone)
+CELL_BLUE    = 100  # blue pillar, stamped once confirmed at the pillar (ref BLUE_COLUMN)
+CELL_YELLOW  = 150  # yellow pillar, stamped once confirmed at the pillar (ref YELLOW_COLUMN)
 
 # Mapping update scheduling (single-loop port of AURE's threaded lidar mapper):
 MAP_UPDATE_PERIOD_STEPS = 1     # rebuild the grid every control step (freshest map for DWA)
@@ -107,25 +110,48 @@ MAP_UPDATE_MAX_OMEGA    = 5.0   # rad/s — only skip mapping during very fast s
                                 # (DWA turns up to ~2.5 rad/s must still map, or it drives blind)
 
 # ── Path planning (AURE A* + clearance + spline) ──────────────────────────────
-ASTAR_INFLATION_LEVELS = [4, 3, 2]  # px — escalating obstacle inflation (safest first)
+ASTAR_INFLATION_LEVELS = [4, 3, 2]  # px — match reference; escalates down to 2 for tight passages
 ASTAR_EXPANSION_PIXELS = 3          # px — free-disk radius around start/goal endpoints
 PATH_MIN_LENGTH_M      = 0.8        # m — shorter A* results are retried at thinner inflation
 ASTAR_SAFE_DISTANCE_PX = 5.0        # px — clearance band within which the wall penalty applies
 ASTAR_PENALTY_STRENGTH = 2.0        # cost weight pushing paths away from walls
 ASTAR_HEURISTIC_WEIGHT = 1.2        # A* heuristic multiplier (matches AURE)
+PLAN_BLOCK_UNKNOWN     = True       # only route through mapped-free space (never through
+                                    # UNKNOWN) — paths can't run into unmapped walls
+ASTAR_FRONTIER_INFLATION = 4        # px — single inflation level for the frontier planner
+                                    # (plan_frontier), which ALLOWS routing through UNKNOWN
 
 # ── DWA local path follower (AURE) ────────────────────────────────────────────
-DWA_VELOCITY_SAMPLES = [0.0, 0.1, 0.2, 0.3]   # m/s; 0.0 lets DWA rotate in place to escape
-DWA_ANGULAR_SAMPLES  = [0.0, 1.0, -1.0, 1.5, -1.5, 2.0, -2.0, 2.5, -2.5]  # rad/s (gentler)
-DWA_ROLLOUT_STEPS    = 15    # forward-prediction horizon (control steps)
-DWA_ROBOT_RADIUS_PX  = 3     # px — true robot half-width; keeps the body clear so it can't wedge
+# Values ported verbatim from the reference project's working DWA.  Note: NO 0.0
+# velocity sample — the robot never pivots in place, it always creeps-and-steers
+# (angular up to ±4.5 rad/s arcs even a U-turn), which is what keeps its motion
+# smooth (no jerky in-place spin).  Obstacle safety comes from the inflated
+# planned path + a direct-collision reject + soft clearance scoring (no hard
+# body-radius reject).
+DWA_VELOCITY_SAMPLES = [0.1, 0.15, 0.2, 0.25, 0.3, 0.35]                    # m/s
+                                 # Max 0.35 m/s.  The 0.4/0.45 top end rammed walls
+                                 # because the rollout only saw ~2.6 cells ahead; here
+                                 # the faster top speed is paired with a LONGER rollout
+                                 # (below) so lookahead grows WITH speed (~3.4 cells at
+                                 # max) — faster in the open, still braking at corners.
+DWA_ANGULAR_SAMPLES  = [0, 2, 2.5, -2, -2.5, 3, -3, 3.5, -3.5, 4.5, -4.5]   # rad/s
+DWA_ROLLOUT_STEPS    = 10    # forward-prediction horizon (~320 ms at 32 ms tick);
+                             # lengthened alongside the higher top speed so the
+                             # endpoint-clearance penalty still sees walls in time
 DWA_HEADING_WEIGHT   = 4.0   # reward facing the target
 DWA_DISTANCE_WEIGHT  = 3.5   # reward closing distance to the target
 DWA_SPEED_WEIGHT     = 0.5   # reward higher speed
 DWA_CLEARANCE_WEIGHT = 2.0   # reward staying away from obstacles
+# Body-aware anti-clip: DWA scores the trajectory CENTRELINE, so a route whose
+# centre skims a wall lets the robot's body clip the corner.  Penalise (softly —
+# no hard reject, so a genuinely tight corridor still yields the least-bad move
+# instead of a stuck refusal) any rollout whose clearance to a known wall drops
+# below the robot's half-width.
+DWA_ROBOT_CLEAR_PX   = 3.0   # robot half-width in cells (~0.10 m); keep this much wall clearance
+DWA_CLEAR_PENALTY    = 4.0   # score penalty per cell of encroachment below DWA_ROBOT_CLEAR_PX
 
 PATH_FOLLOWING_TARGET_REACH_DIST_PX = 4   # px — waypoint considered reached within this
-FOLLOW_WAYPOINT_STRIDE = 5                # advance this many path cells per waypoint
+FOLLOW_WAYPOINT_STRIDE = 5                # step ahead this many waypoints once one is reached (AURE)
 FOLLOW_STUCK_MOVE_M = 0.005               # m/tick below which progress counts as stalled
 FOLLOW_STUCK_TURN_RAD = 0.03              # rad/tick — rotating this much still counts as progress
 FOLLOW_STUCK_STEPS  = 25                  # stalled ticks before declaring "stuck"
@@ -134,13 +160,113 @@ FOLLOW_STUCK_STEPS  = 25                  # stalled ticks before declaring "stuc
 # over a window, the path is stale (a wall was discovered on it) -> replan.
 FOLLOW_PROGRESS_WINDOW = 40   # control ticks between progress checks
 FOLLOW_MIN_PROGRESS_PX = 3    # min cells closer to goal per window, else replan
+FOLLOW_MAX_RETRIES = 6        # replans allowed on stuck in manual Follow (Y) before giving up
+
+# When DWA is boxed (target behind a newly-seen wall) or the robot stalls in a
+# pocket (no net progress), back out and turn to escape; after a few failed
+# windows report "stuck" so the caller replans.  Self-contained in following.py.
+FOLLOW_RECOVER_STEPS  = 25    # ticks spent backing out + turning
+FOLLOW_RECOVER_VEL    = -0.12 # m/s reverse speed during recovery
+FOLLOW_RECOVER_OMEGA  = 1.2   # rad/s turn while reversing (arc out, re-orient)
+FOLLOW_MAX_RECOVERS   = 3     # no-progress windows before reporting "stuck" (-> replan)
+FOLLOW_PROGRESS_WIN   = 45    # ticks over which progress TOWARD THE GOAL is checked
+FOLLOW_MIN_PROGRESS_CELLS = 2 # min cells closer to the goal per window, else it's stalled
+
+# Pivot in place to face the next waypoint before driving, so sharp corners are
+# turned cleanly instead of arced into the inside wall.
+FOLLOW_ALIGN_RAD   = 0.7      # rad — align first when the target is beyond this heading error
+FOLLOW_ALIGN_OMEGA = 2.5      # rad/s — pivot rate while aligning
 
 # ── Frontier exploration (AURE) ───────────────────────────────────────────────
 FRONTIER_MIN_CLUSTER       = 15   # min frontier cells to keep a cluster
 FRONTIER_MIN_SIZE          = 20   # min cluster size to score as a primary target
 FRONTIER_MIN_DIST_PX       = 5    # ignore frontiers closer than this (already here)
-FRONTIER_VISITED_RADIUS_PX = 8    # a frontier within this of a visited one is skipped
+# Drop frontier cells within this radius of the robot at DETECTION time.  The
+# cells in a small disk under the robot never get cleared (they sit below the
+# lidar's minimum range), so their boundary is a phantom frontier ring that moves
+# WITH the robot and can never be cleared — selecting it traps exploration in
+# place.  Must exceed the unmapped-disk radius (a few px).  Unlike
+# FRONTIER_MIN_DIST_PX (a scored-selector filter the random fallback ignores),
+# this removes the ring from candidacy entirely.
+FRONTIER_SELF_EXCLUDE_PX   = 12
+FRONTIER_VISITED_RADIUS_PX = 30   # a frontier centroid within this of a visited one is skipped
 FRONTIER_SCORE_BIAS        = 15   # utility = size / (distance + bias)
+# When the mission has SIGHTED the active target pillar, frontier/free-cell
+# selection is steered toward it: utility *= (1 + PILLAR_BIAS_WEIGHT * alignment),
+# where alignment in [0,1] is how well heading to that goal points at the pillar.
+# 0 = pure frontier (unbiased); larger = more strongly pulled toward the pillar.
+PILLAR_BIAS_WEIGHT         = 2.0
+
+# Orchestration cadence (verbatim from the reference CONSTANTS.py).
+EXPLORATION_START_FRONTIER_AFTER    = 50  # start scored frontier selection after N outer iterations
+EXPLORATION_FRONTIER_SELECTION_FREQ = 5   # select a new frontier every N outer iterations
+EXPLORE_FREESPACE_RADIUS_PX         = 40  # px — random-freespace fallback search radius
+EXPLORE_FREESPACE_TRIES             = 200 # attempts to sample a nearby free cell
+
+# Anti-idle fallback: when NEITHER a frontier NOR a nearby free cell yields a path
+# this iteration, the robot must not just sit there (that starves the map and it
+# never recovers).  Rotate in place to reveal new space, and periodically forget
+# the visited-frontier blacklist so frontiers it gave up on become selectable again.
+EXPLORE_SCAN_TURN_TICKS      = 18   # ticks to rotate in place when no path is available
+EXPLORE_SCAN_TURN_WHEEL      = 4.0  # wheel speed (rad/s) for the in-place reveal rotation
+EXPLORE_FORGET_VISITED_EVERY = 6    # clear the visited blacklist after this many no-path spins
+# Obstacle-recovery escalation: a straight reverse alone can't free a robot nosed
+# into a corner — it just backs out and the replan drives it in at the same angle
+# again (the wedge loop).  After this many consecutive obstacle recoveries, also
+# TURN toward the more-open side so the re-approach comes in at a new heading.
+OBSTACLE_RECOVER_TURN_AFTER  = 2
+
+# ── SLAM: FastSLAM 2.0 particle filter (verbatim from the reference CONSTANTS.py) ──
+SLAM_NUM_PARTICLES       = 30    # match reference.  observe cost ~ particles x beams; 30x45 (theirs)
+                                 # = 15x90 (our old) in COST, but 30 particles gives a far better pose
+                                 # estimate -> crisper map.  Particle count, not beam count, drives pose.
+SLAM_ALPHA1              = 0.02  # motion noise: rotation error from translation
+SLAM_ALPHA2              = 0.02  # motion noise: rotation error from rotation
+SLAM_ALPHA3              = 0.05  # motion noise: translation error from translation
+SLAM_ALPHA4              = 0.01  # motion noise: translation error from rotation
+SLAM_SCAN_MAX_BEAMS      = 45    # match reference (was 90); paired with 30 particles for same total cost
+SLAM_RESAMPLE_NEFF_RATIO = 0.5   # resample when effective sample size < ratio * num_particles
+SLAM_LIKELIHOOD_SIGMA_M  = 0.08  # std-dev (m) of the likelihood-field Gaussian used to weight particles
+SLAM_REFINE_RADIUS_PX    = 2     # +/- px searched to snap each particle onto its own map (FastSLAM 2.0 proposal)
+SLAM_REFINE_WINDOW_DEG   = 6.0   # +/- deg searched for the same pose-refinement step
+SLAM_REFINE_STEP_DEG     = 2.0   # angular step size for the pose-refinement search
+SLAM_OBSERVE_HZ = 10             # measurement-update rate of the background mapping thread
+                                 # (matches the reference's ~10 Hz lidar thread; only when not turning)
+# Motion gate for observe(): only fold a scan once the robot has actually moved
+# this far since the last update.  The ~10 Hz thread otherwise refines/rasterizes
+# all particles every cycle even while parked, which (a) makes the particle cloud
+# jitter in place and the published map shimmer, and (b) burns CPU on no-op
+# updates.  Gating on travelled distance is the standard SLAM practice ("update
+# on motion, not on a clock") and is the efficient choice: no work when nothing
+# changed.  ~1 cell of translation (MAP_RES_M) or ~3 deg of small residual turn.
+SLAM_OBSERVE_MIN_TRANS_M = 0.03  # accumulated |Δtranslation| (m) needed to trigger an observe
+SLAM_OBSERVE_MIN_ROT_RAD = 0.052 # accumulated |Δrotation| (rad, ~3 deg) needed to trigger an observe
+SLAM_GREEN_PERIOD_STEPS = 3      # main-thread green-ground marking cadence (~10 Hz at 32 ms tick)
+
+# ── SLAM: pose-graph loop closure (verbatim from the reference CONSTANTS.py) ───
+# Consumed by pose_graph.py.
+KEYFRAME_DIST_THRESHOLD_M      = 0.15   # add a new keyframe after moving this far
+KEYFRAME_ANGLE_THRESHOLD_DEG   = 15.0   # ...or turning this much since the last keyframe
+LOOP_CLOSURE_SEARCH_RADIUS_M   = 0.6    # only consider keyframes within this radius as candidates
+LOOP_CLOSURE_MIN_KEYFRAME_GAP  = 15     # ignore the most recent N keyframes (avoid trivial closures)
+LOOP_CLOSURE_SCORE_THRESHOLD   = 0.06   # max mean nearest-neighbour distance (m) to accept a match
+LOOP_CLOSURE_SEARCH_WINDOW_M   = 0.3    # coarse search window (+/- m) for dx, dy in scan matching
+LOOP_CLOSURE_SEARCH_STEP_M     = 0.033  # step size (1 px) for dx, dy coarse search
+LOOP_CLOSURE_SEARCH_WINDOW_DEG = 20.0   # coarse search window (+/- deg) for dtheta
+LOOP_CLOSURE_SEARCH_STEP_DEG   = 2.0    # step size (deg) for dtheta coarse search
+# Cooldown (NOT in the reference): apply at most one loop closure per this many
+# keyframes.  The full-map rebuild after a closure costs O(keyframes), so firing
+# it every frame — as happens when keyframes pile up in one spot (robot wedged /
+# spinning) — is an O(keyframes^2) runaway that freezes the sim.  A single good
+# closure already corrects the drift; re-closing every frame is wasted work.
+LOOP_CLOSURE_COOLDOWN_KEYFRAMES = 20
+# Attempt throttle (NOT in the reference): even a FAILED closure attempt runs the
+# full candidate scan-match search, whose cost grows with keyframe count (more
+# keyframes fall within the search radius over time).  The cooldown above only
+# gates attempts AFTER a success, so between successes the search fires every
+# keyframe -> the search time climbs unboundedly as the map fills.  Only attempt
+# every N keyframes; a real revisit is still caught within N frames.
+LOOP_CLOSURE_ATTEMPT_INTERVAL = 8
 
 # Recovery maneuver when the follower reports "stuck" (wedged against a wall):
 # reverse (if the rear is clear), then turn a fixed spell, then re-select.
@@ -157,7 +283,29 @@ SEEK_LIN_VEL              = 0.20  # m/s   — forward speed when target is centr
 SEEK_OMEGA                = 0.40  # rad/s — yaw rate while orienting toward target
 SEEK_BEARING_DEADBAND_RAD = 0.10  # rad   — |bearing| at or below this counts as centred
 
-# ── Mission ───────────────────────────────────────────────────────────────────
-TARGET_REACHED_DIST_M     = 0.50  # m     — depth-at-centroid below this counts as reached
-APPROACH_OFFSET_M         = 0.40  # m     — aim this far in front of a pillar (its cell is an obstacle)
-MISSION_REACHED_RATIO     = 0.25  # frame fraction a pillar fills that also counts as reached
+# ── Mission (FR5: reach blue, then yellow) ────────────────────────────────────
+# Once the active pillar has been sighted, exploration is biased toward it
+# (PILLAR_BIAS_WEIGHT) but keeps mapping; the mission switches to the precise
+# final drive (_drive_to) only once the robot is within this range of the seen
+# pillar.  Committing from far to a depth-noisy sighting caused arrive-at-wrong-
+# spot retries, so we approach under bias first and commit close.
+PILLAR_COMMIT_DIST_M      = 1.0   # m     — biased-explore -> final-drive handoff range
+TARGET_REACHED_DIST_M     = 0.50  # m     — legacy reactive target-reached depth (autonomous.py G-mode)
+APPROACH_OFFSET_M         = 0.30  # m     — A* stand-off in front of a pillar; MUST be < the mark gate
+                                  # (MISSION_MARK_LASER_M) or the robot parks just short and never marks
+# Registration gate: a pillar is only marked "seen/visited" (stamped on the map in
+# its colour + FSM advances) once the robot is CONFIRMED within this distance and
+# the pillar is visible.  A distant glimpse is used to navigate toward the pillar
+# but never registers it — the robot must approach to confirm.
+# The depth-based column distance (estimate_column_distance Pythagoras) is NOT
+# trustworthy for the mark gate: it saturates to inf at contact and badly
+# UNDER-estimates far pillars (a ~5 m pillar read as 1.49 m), which caused false
+# "reached" marks from across the map.  So a pillar is registered ONLY on signals
+# that reliably mean "genuinely at the pillar" (matching the reference
+# follow_final_path reached-logic): it fills the view, OR the front laser is at
+# contact range while the pillar is centred.  The depth distance is used only to
+# navigate TOWARD a pillar (direction), never to confirm arrival.
+MISSION_MARK_RATIO        = 0.20  # frame fraction a pillar must fill to count as reached (ref 0.20)
+MISSION_MARK_LASER_M      = 0.35  # m   — front-laser contact range that confirms a centred pillar (ref 0.35)
+MISSION_MARK_BEARING_RAD  = 0.25  # rad — |pillar bearing| must be within this to trust the laser signal
+MISSION_MARK_MAX_STAMP_M  = 0.60  # m   — clamp for where the pillar cell is stamped (reliable close range)

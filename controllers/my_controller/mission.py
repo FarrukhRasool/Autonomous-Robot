@@ -1,47 +1,90 @@
-"""Blue-then-yellow mission coordinator for the Husarion RosBot.
+"""Blue-then-yellow mission (FR5) for the Husarion RosBot.
 
-Ties perception into the explore -> plan -> follow -> safety stack to fulfil the
-assignment goal (FR5): reach the BLUE pillar first, then the YELLOW pillar.
+Sequential state machine SEEKING_BLUE -> SEEKING_YELLOW -> DONE, the most
+time-efficient ordering that still satisfies the spec's hard blue-first rule
+(CLAUDE.md / FR5: reach blue first, then yellow; minimize simulation time):
 
-Pure — no Webots imports; the caller passes in the camera colour detections
-(sensors.read_color_detections()).  Reuses exploration (to find a pillar when
-it is not visible) and planning + following (to drive to it once seen).
+  * SEEKING_BLUE  — explore only until BLUE is seen (localized), then drive to it.
+                    Any YELLOW glimpsed along the way is opportunistically
+                    remembered (but not chased).
+  * SEEKING_YELLOW— if yellow was already seen while seeking blue, head straight
+                    there (traceback, no re-exploration); otherwise explore until
+                    yellow is seen, then drive to it.
+  * DONE          — both reached, stop.
 
-State machine: SEEKING_BLUE -> SEEKING_YELLOW -> DONE.  Yellow is never sought
-or accepted until blue has been reached.
+This is strictly better than a "find both, then backtrack to blue" scheme (which
+traverses the blue<->yellow gap twice) and than the reference's approach (which
+ends at yellow without guaranteeing blue-first).
+
+Ideas reused from the reference (Hieu Tran et al.): the column reached heuristic
+(frame-ratio / depth / front-lidar close) and the plan->follow->recover drive
+structure of follow_final_path.  Column PERCEPTION is this project's synchronous
+sensors.read_color_detections (our FR4 port of their estimate_column_distance /
+HSV) + perception world-projection/memory, not their background camera thread.
+Not ported: red-wall dead-end closure (maze-specific -> violates generalization).
+
+Blocking, like exploration.run(): call mission.run(should_continue); it drives
+until DONE or should_continue() returns False.  The background SLAM thread keeps
+mapping throughout; this module only reads the SLAM pose/map.
 """
 
 import math
 
+import devices
+import sensors
+import motion
+import localization
 import mapping
 import planning
-import following
-import exploration
 import perception
+import exploration
 from config import (
-    TARGET_REACHED_DIST_M, APPROACH_OFFSET_M, MISSION_REACHED_RATIO,
+    APPROACH_OFFSET_M, MISSION_MARK_RATIO,
+    MISSION_MARK_LASER_M, MISSION_MARK_BEARING_RAD, MISSION_MARK_MAX_STAMP_M,
+    GREEN_MARK_ENABLED, SLAM_GREEN_PERIOD_STEPS,
+    FOLLOW_WAYPOINT_STRIDE,
+    SEEK_LIN_VEL, SEEK_OMEGA, SEEK_BEARING_DEADBAND_RAD,
+    PILLAR_COMMIT_DIST_M,
 )
 
 SEEKING_BLUE, SEEKING_YELLOW, DONE = 0, 1, 2
 _NAMES = {SEEKING_BLUE: "SEEKING_BLUE", SEEKING_YELLOW: "SEEKING_YELLOW", DONE: "DONE"}
 
+# ── State ─────────────────────────────────────────────────────────────────────
+# _seen: printed-once flag when a column is first spotted (any distance) — a
+#        sighting sets perception memory so the robot can navigate toward it.
+# _registered: the pillar has been CONFIRMED at contact range and stamped
+#        on the map in its colour (the "visited/seen" mark the min-distance gate
+#        controls).  A distant glimpse never registers a pillar.
+_seen = {"blue": False, "yellow": False}
+_registered = {"blue": False, "yellow": False}
 _state = SEEKING_BLUE
-_goal_cell = None       # current approach cell for the active pillar
+_tick_count = 0
+_current_route = None   # the live A* route being driven (for the map overlay)
+
+
+def reset():
+    global _seen, _registered, _state, _tick_count, _current_route
+    _seen = {"blue": False, "yellow": False}
+    _registered = {"blue": False, "yellow": False}
+    _state = SEEKING_BLUE
+    _tick_count = 0
+    _current_route = None
+    perception.reset_target_memory()
+
+
+def current_path():
+    """The complete route the mission is currently driving (list of (x, y) map
+    cells), e.g. the blue->yellow traceback path — for the live-map overlay."""
+    return _current_route
 
 
 def state_name():
     return _NAMES.get(_state, "?")
 
 
-def current_goal():
-    return _goal_cell
-
-
 def pillar_cells():
-    """Remembered blue/yellow pillar map cells, for colored map overlays.
-
-    Returns {"blue": (x, y) | None, "yellow": (x, y) | None}.
-    """
+    """Remembered blue/yellow pillar map cells (for the live-map overlay)."""
     out = {}
     for c in ("blue", "yellow"):
         mem = perception.get_target_memory(c)
@@ -49,35 +92,91 @@ def pillar_cells():
     return out
 
 
-def reset():
-    """Restart the mission at SEEKING_BLUE and clear all navigation state."""
-    global _state, _goal_cell
-    _state = SEEKING_BLUE
-    _goal_cell = None
-    following.reset()
-    exploration.reset()
-    print("[MISSION] reset -> SEEKING_BLUE")
+# ── Perception: localize columns (any distance) + register when close ─────────
+
+def _within_mark_dist(color, colors):
+    """True only if `color` is CONFIRMED genuinely at the pillar — via signals that
+    don't depend on the unreliable depth-Pythagoras distance:
+      1. the mask fills MISSION_MARK_RATIO of the frame (pillar dominates view), OR
+      2. the front LASER is at contact range (< MISSION_MARK_LASER_M) while the
+         pillar is centred (|bearing| < MISSION_MARK_BEARING_RAD) — a wall can't
+         trigger it because the pillar must be visible AND pointing forward.
+    (The depth distance is deliberately NOT used here: it underestimates far
+    pillars badly, which caused false 'reached' marks from across the map.)
+    """
+    if not colors.get(color):
+        return False
+    ratio = colors.get(f"{color}_ratio", 0.0)
+    bearing = colors.get(f"{color}_bearing_rad")
+    if ratio >= MISSION_MARK_RATIO:
+        return True
+    if (bearing is not None and abs(bearing) < MISSION_MARK_BEARING_RAD
+            and exploration._get_lidar_front_min_dist(angle_range_deg=15) < MISSION_MARK_LASER_M):
+        return True
+    return False
 
 
-def _advance(active):
-    global _state, _goal_cell
-    if _state == SEEKING_BLUE:
-        _state = SEEKING_YELLOW
-        print("[MISSION] BLUE reached -> SEEKING_YELLOW")
-    elif _state == SEEKING_YELLOW:
-        _state = DONE
-        print("[MISSION] YELLOW reached -> DONE")
-    _goal_cell = None
-    following.reset()
-    exploration.reset()      # fresh exploration memory for the next target
+def _perceive(colors=None):
+    """Per-tick perception for the mission.  For each visible column:
+      * update perception memory with its projected world position (used to
+        navigate toward it — a distant sighting is enough for this), and
+      * once CONFIRMED at the pillar (_within_mark_dist), stamp its cell on the
+        map in its colour and flag it registered/visited (the mark gate).
+    """
+    if colors is None:
+        colors = sensors.read_color_detections()
+    pose = localization.get_pose()
+    for color in ("blue", "yellow"):
+        if not colors.get(color):
+            continue
+        bearing = colors.get(f"{color}_bearing_rad")
+        dist = colors.get(f"{color}_distance_m", float("inf"))
+        if bearing is None or not math.isfinite(dist):
+            continue
+        # Localize (for navigation direction) on every sighting, any distance.
+        perception.update_target_memory(color, pose, bearing, dist)
+        if not _seen[color]:
+            print(f"[MISSION] {color} column spotted (dist~{dist:.2f} m) — approaching to confirm")
+            _seen[color] = True
+        # Register + colour-stamp only once CONFIRMED at the pillar.
+        if _within_mark_dist(color, colors) and not _registered[color]:
+            # Stamp at the reliable close range (front laser, clamped), directly
+            # ahead — the pillar is centred at this moment — NOT the bad depth dist.
+            fd = exploration._get_lidar_front_min_dist(angle_range_deg=15)
+            stamp_d = fd if math.isfinite(fd) and fd <= MISSION_MARK_MAX_STAMP_M else MISSION_MARK_MAX_STAMP_M
+            world = perception.target_world_position(pose, bearing, stamp_d)
+            if world is not None:
+                mapping.mark_pillar(mapping.world_to_map(world[0], world[1]), color)
+            _registered[color] = True
+            print(f"[MISSION] {color} pillar reached & marked on map "
+                  f"(laser={fd:.2f} m, ratio={colors.get(f'{color}_ratio', 0):.3f})")
 
+
+# ── Commit gate: biased-explore -> final-drive handoff ────────────────────────
+
+def _close_to_mem(color):
+    """True if the robot is within PILLAR_COMMIT_DIST_M of the remembered pillar."""
+    mem = perception.get_target_memory(color)
+    if mem is None:
+        return False
+    px, py = localization.get_position()
+    return math.hypot(mem[0] - px, mem[1] - py) <= PILLAR_COMMIT_DIST_M
+
+
+def _should_commit(color, colors):
+    """Stop biased exploration and hand off to the precise final drive once the
+    pillar is confirmed at contact range OR the robot is within the commit
+    distance of the remembered sighting.  Approaching under bias first (rather
+    than committing from a far, depth-noisy glimpse) avoids arrive-at-wrong-spot
+    retries."""
+    return _within_mark_dist(color, colors) or _close_to_mem(color)
+
+
+# ── Final drive helpers ───────────────────────────────────────────────────────
 
 def _approach_cell(pose, world):
-    """Map cell APPROACH_OFFSET_M in front of the pillar.
-
-    The pillar's own cell is an obstacle in the grid, so we aim for a free cell
-    a short distance in front of it along the robot->pillar line.
-    """
+    """Map cell APPROACH_OFFSET_M in front of a pillar (the pillar cell itself is
+    an obstacle), along the robot->pillar line."""
     px, py = pose[0], pose[1]
     wx, wy = world
     dx, dy = wx - px, wy - py
@@ -89,77 +188,187 @@ def _approach_cell(pose, world):
     return mapping.world_to_map(ax, ay)
 
 
-def mission_step(pose, dt, colors):
-    """Advance one mission tick.  Returns (v, omega, status, debug)."""
-    global _goal_cell
-
-    debug = {"state": _NAMES[_state], "goal": _goal_cell,
-             "active": None, "visible": False, "dist": float("inf")}
-
-    # Remember BOTH pillars whenever either is seen — so a yellow spotted while
-    # seeking blue is available for free later (and vice-versa).
-    for c in ("blue", "yellow"):
-        if colors.get(c) and colors.get(f"{c}_bearing_rad") is not None:
-            perception.update_target_memory(
-                c, pose, colors[f"{c}_bearing_rad"], colors.get(f"{c}_distance_m", float("inf"))
-            )
-
-    if _state == DONE:
-        return 0.0, 0.0, "done", debug
-
-    active = "blue" if _state == SEEKING_BLUE else "yellow"
-    visible = bool(colors.get(active)) and colors.get(f"{active}_bearing_rad") is not None
-    dist = colors.get(f"{active}_distance_m", float("inf"))
-    ratio = colors.get(f"{active}_ratio", 0.0)
-    debug.update({"active": active, "visible": visible, "dist": dist})
-
-    # Reached only when we actually SEE the pillar up close (confirm, don't trust
-    # a possibly-stale memory alone).
-    reached = visible and (
-        (math.isfinite(dist) and dist < TARGET_REACHED_DIST_M) or ratio > MISSION_REACHED_RATIO
+def _tick():
+    """Advance the sim one step and feed odometry to SLAM (predict); the
+    background thread keeps folding scans into the map.  Green marking runs on its
+    cadence.  Returns the raw step result (-1 on sim end)."""
+    global _tick_count
+    result = devices.robot.step(devices.timestep)
+    if result == -1:
+        return -1
+    left_rad, right_rad = sensors.read_wheel_angles()
+    localization.update_from_encoders(
+        left_rad, right_rad, sensors.read_imu_yaw(), sensors.read_gyro_z()
     )
-    if reached:
-        _advance(active)
-        return 0.0, 0.0, f"reached_{active}", debug
+    _tick_count += 1
+    if (GREEN_MARK_ENABLED
+            and _tick_count % SLAM_GREEN_PERIOD_STEPS == 0
+            and not motion.is_turning()):
+        green_pts = sensors.green_ground_points_body()
+        if len(green_pts) > 0:
+            mapping.mark_green(localization.get_pose(), green_pts)
+    return result
 
-    # World position of the active target: live projection if visible, else the
-    # remembered sighting — this is what lets us head straight to a known pillar.
-    active_world = None
-    if visible:
-        active_world = perception.target_world_position(pose, colors[f"{active}_bearing_rad"], dist)
-    if active_world is None:
-        active_world = perception.get_target_memory(active)
 
-    if active_world is not None:
-        new_goal = _approach_cell(pose, active_world)
-        if new_goal != _goal_cell:
-            _goal_cell = new_goal
-            following.reset()              # re-plan to the updated approach cell
+def _drive_to(color, should_continue):
+    """Drive to the remembered `color` pillar: known-free A* to a stand-off cell
+    in front of it + DWA following, continuously re-planning toward the (refined)
+    remembered position after each finished path or recovery.  Returns True once
+    the pillar is CONFIRMED within the registration distance (_within_mark_dist),
+    False if aborted/unreachable.
+    """
+    global _current_route
+    replans = 0
+    while should_continue():
+        world = perception.get_target_memory(color)
+        if world is None:
+            return False
 
-    robot_cell = mapping.world_to_map(pose[0], pose[1])
+        goal_cell = _approach_cell(localization.get_pose(), world)
+        route = planning.plan(tuple(exploration._get_map_position()), goal_cell)
+        if not route or len(route) < 2:
+            # Can't plan a path -- if we're already confirmed at the pillar, win.
+            colors = sensors.read_color_detections()
+            _perceive(colors)
+            if _within_mark_dist(color, colors):
+                exploration._stop_motor()
+                return True
+            return False
 
-    # Drive to the known approach cell via plan + follow.
-    if _goal_cell is not None:
-        if not following.has_path():
-            route = planning.plan(robot_cell, _goal_cell)
-            if route:
-                following.set_path(route)
-            else:
-                _goal_cell = None          # unreachable -> fall back to exploring
-        if following.has_path():
-            v, w, st = following.step(pose, dt)
-            if st in ("done", "stuck", "idle"):
-                following.reset()
-                _goal_cell = None
-                # Arrived at a remembered spot but the pillar isn't actually
-                # there -> the memory was stale; forget it and go explore.
-                if not visible:
-                    perception.forget_target(active)
-                return 0.0, 0.0, f"approach_{st}_{active}", debug
-            return v, w, f"going_to_{active}", debug
+        current_path = list(route)
+        _current_route = current_path        # expose the full route for the live map
+        target_index = FOLLOW_WAYPOINT_STRIDE
+        need_replan = False
 
-    # Target not visible / not reachable yet -> explore to discover it.
-    v, w, ex = exploration.explore_step(pose, dt)
-    if ex == "complete":
-        exploration.reset()                # keep searching for the pillar
-    return v, w, f"seeking_{active}", debug
+        while target_index < len(current_path) and not need_replan:
+            target = current_path[target_index]
+            while _tick() != -1:
+                if not should_continue():
+                    exploration._stop_motor()
+                    return False
+
+                colors = sensors.read_color_detections()
+                _perceive(colors)                        # localize + register both pillars
+                if _within_mark_dist(color, colors):     # confirmed within mark distance
+                    exploration._stop_motor()
+                    return True
+
+                # ── Reactive visual approach (autonomous.py seek) ──────────────
+                # When the pillar is IN SIGHT, drive straight at it (centre the
+                # bearing, then creep forward) instead of following the A* path to
+                # the depth-estimated cell.  Line-of-sight so it reliably closes
+                # the final gap and marks — this is what stops the earlier
+                # "drive -> not reached -> re-explore" loop.  A* below still runs
+                # when the pillar is NOT visible (to bring it into view).
+                bearing = colors.get(f"{color}_bearing_rad")
+                if colors.get(color) and bearing is not None and not exploration._obstacle_in_front():
+                    if abs(bearing) > SEEK_BEARING_DEADBAND_RAD:
+                        motion.drive_twist(0.0, math.copysign(SEEK_OMEGA, bearing))
+                    else:
+                        motion.drive_twist(SEEK_LIN_VEL, 0.0)
+                    continue
+
+                if exploration._obstacle_in_front():
+                    exploration._recover_from_obstacle()
+                    need_replan = True
+                    break
+
+                reached, is_stuck = exploration._follow_local_target(target)
+                if is_stuck:
+                    exploration._recover_from_stuck()
+                    need_replan = True
+                    break
+                if reached:
+                    break
+            target_index += FOLLOW_WAYPOINT_STRIDE
+
+        replans += 1
+        if replans > 12:            # give up after persistent failure to make progress
+            exploration._stop_motor()
+            return False
+
+    exploration._stop_motor()
+    return False
+
+
+def _seek_and_reach(color, should_continue):
+    """Reach the `color` pillar: explore until it is SEEN (localized) if we don't
+    already know where it is, then drive to it.  While exploring for it, any OTHER
+    pillar seen is opportunistically remembered (so a yellow spotted while seeking
+    blue is available for free later).  Retries (forget stale memory + re-explore)
+    if a drive arrives at the remembered spot but the pillar isn't actually there.
+    Returns True when the pillar is reached, False if aborted.
+    """
+    attempts = 0
+    while should_continue():
+        # ── If the pillar's location is UNKNOWN, explore to find it ───────────
+        # (biased toward it once sighted; a sighting steers exploration but does
+        # NOT stop it — only the commit distance / contact range does).  If we
+        # ALREADY know where it is (e.g. yellow spotted while seeking blue), skip
+        # exploration entirely and go straight to the direct traceback drive,
+        # which plans and follows the full blue->yellow path.
+        if perception.get_target_memory(color) is None:
+            def _hook():
+                colors = sensors.read_color_detections()
+                _perceive(colors)                         # localize + register whatever is visible
+                mem = perception.get_target_memory(color)
+                if mem is not None:
+                    exploration.set_target_bias(mem)      # steer exploration toward the active pillar
+                    if _should_commit(color, colors):
+                        return False                      # close/confirmed -> hand off to the drive
+                return should_continue()
+
+            print(f"[MISSION] exploring to find {color} pillar...")
+            exploration.reset()
+            exploration.run(_hook)
+            exploration.clear_target_bias()
+            if perception.get_target_memory(color) is None:
+                return False                              # aborted before ever seeing it
+
+        # ── Drive to it ───────────────────────────────────────────────────────
+        print(f"[MISSION] {color} localized -> driving to it...")
+        if _drive_to(color, should_continue):
+            return True
+
+        # Arrived at the remembered spot but not actually at the pillar -> the
+        # sighting was stale/imprecise; forget it and look again.
+        print(f"[MISSION] {color} not reached at remembered spot -> re-acquiring")
+        perception.forget_target(color)
+        attempts += 1
+        if attempts > 6:
+            return False
+    return False
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def run(should_continue):
+    """Sequential blue-then-yellow mission (FR5), most time-efficient ordering:
+    seek+reach BLUE, then seek+reach YELLOW.  Yellow glimpsed while seeking blue
+    is remembered, so the yellow phase heads straight there (traceback) instead of
+    re-exploring.  Runs until DONE or should_continue() returns False.
+    """
+    global _state
+    reset()
+    exploration.reset()
+
+    _state = SEEKING_BLUE
+    print("[MISSION] SEEKING_BLUE")
+    if not _seek_and_reach("blue", should_continue):
+        print("[MISSION] stopped before reaching blue")
+        return
+    print("[MISSION] BLUE reached")
+
+    _state = SEEKING_YELLOW
+    if perception.get_target_memory("yellow") is not None:
+        print("[MISSION] SEEKING_YELLOW (yellow already seen while seeking blue -> traceback)")
+    else:
+        print("[MISSION] SEEKING_YELLOW")
+    if not _seek_and_reach("yellow", should_continue):
+        print("[MISSION] stopped before reaching yellow")
+        return
+    print("[MISSION] YELLOW reached")
+
+    _state = DONE
+    motion.stop_robot()
+    print("[MISSION] DONE — reached blue then yellow.")

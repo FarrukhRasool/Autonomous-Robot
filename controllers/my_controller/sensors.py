@@ -315,7 +315,13 @@ def read_lidar_pointcloud_2d():
     if pts.size == 0:
         return empty
     finite = ~np.isinf(pts).any(axis=1) & ~np.isnan(pts).any(axis=1)
-    return pts[finite]
+    pts = pts[finite]
+    if pts.shape[0] == 0:
+        return empty
+    # Full-range point cloud (matches the reference get_pointcloud_2d): no distance
+    # cap.  With 30 particles the pose is accurate enough that far returns don't
+    # smear; SLAM downsamples the scan (SLAM_SCAN_MAX_BEAMS) itself.
+    return pts
 
 
 def _read_vector(sensor, method):

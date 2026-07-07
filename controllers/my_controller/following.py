@@ -15,13 +15,20 @@ Conventions: pose is (x_m, y_m, theta_rad) world frame; paths are lists of
 
 import math
 
+import numpy as np
+import cv2
+
 import mapping
 from kinematics import WHEEL_RADIUS_M, MAX_WHEEL_SPEED_RAD_S
 from config import (
-    DWA_VELOCITY_SAMPLES, DWA_ANGULAR_SAMPLES, DWA_ROLLOUT_STEPS, DWA_ROBOT_RADIUS_PX,
+    DWA_VELOCITY_SAMPLES, DWA_ANGULAR_SAMPLES, DWA_ROLLOUT_STEPS,
     DWA_HEADING_WEIGHT, DWA_DISTANCE_WEIGHT, DWA_SPEED_WEIGHT, DWA_CLEARANCE_WEIGHT,
+    DWA_ROBOT_CLEAR_PX, DWA_CLEAR_PENALTY,
     PATH_FOLLOWING_TARGET_REACH_DIST_PX, FOLLOW_WAYPOINT_STRIDE,
-    FOLLOW_STUCK_MOVE_M, FOLLOW_STUCK_TURN_RAD, FOLLOW_STUCK_STEPS,
+    FOLLOW_RECOVER_STEPS, FOLLOW_RECOVER_VEL, FOLLOW_RECOVER_OMEGA, FOLLOW_MAX_RECOVERS,
+    FOLLOW_PROGRESS_WIN, FOLLOW_MIN_PROGRESS_CELLS,
+    REAR_SAFE_DIST,
+    CELL_OCC, CELL_GREEN, CELL_CLOSED, CELL_BLUE, CELL_YELLOW,
 )
 
 # Forward-speed cap used to normalise the DWA speed reward (m/s).
@@ -30,8 +37,10 @@ _MAX_SPEED = MAX_WHEEL_SPEED_RAD_S * WHEEL_RADIUS_M
 # ── Follower state ────────────────────────────────────────────────────────────
 _path = None
 _target_index = 0
-_stuck_last_pos = None
-_stuck_count = 0
+_recover_ticks = 0    # >0 while backing out of a wall the path runs into
+_recover_count = 0    # no-progress windows so far (escalates to "stuck" -> replan)
+_prog_ref = None      # robot (x, y) at the start of the current progress window
+_prog_ticks = 0       # ticks elapsed in the current progress window
 
 
 def _wrap(a):
@@ -42,14 +51,39 @@ def _map_dist(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def _obstacle_distance_field():
+    """Euclidean distance (in cells) from every cell to the nearest KNOWN obstacle
+    (wall / green / pillar / closed).  UNKNOWN is treated as free, so the follower
+    still enters unmapped space during exploration and only keeps clearance from
+    things actually on the map.  cv2.distanceTransform is C (releases the GIL): one
+    cheap pass per DWA call, and O(1) clearance lookups replace the old per-rollout
+    5x5 Python scan."""
+    grid = mapping.get_grid()
+    obstacle = ((grid == CELL_OCC) | (grid == CELL_GREEN) | (grid == CELL_CLOSED)
+                | (grid == CELL_BLUE) | (grid == CELL_YELLOW))
+    free_src = np.where(obstacle, 0, 255).astype(np.uint8)
+    return cv2.distanceTransform(free_src, cv2.DIST_L2, 3)
+
+
 def dwa_velocity(pose, world_target, dt):
     """AURE Dynamic Window: pick the (v, omega) that best drives toward
-    world_target while its short forward rollout stays clear of mapped
-    obstacles.  Score = heading + distance-progress + speed + clearance.
+    world_target while its short forward rollout stays clear of mapped obstacles.
+    Score = heading + distance-progress + speed + clearance - body-clip penalty.
+
+    Body-aware anti-clip: DWA scores the trajectory CENTRELINE, so a route whose
+    centre only skims a wall lets the robot's body clip corridor corners.  Every
+    rollout cell's clearance is read from a distance field; a rollout that comes
+    within the robot's half-width (DWA_ROBOT_CLEAR_PX) of a known wall is penalised
+    (steeper the closer it gets).  It's a SOFT penalty, not a reject: when every
+    option is tight the least-bad one still wins, so a narrow corridor yields a
+    careful move instead of a stuck refusal.
     """
     x, y, theta = pose
     tx, ty = world_target
     current_distance = math.hypot(tx - x, ty - y)
+
+    dist_field = _obstacle_distance_field()
+    map_h, map_w = dist_field.shape
 
     best_score = -float("inf")
     best_v = 0.0
@@ -60,10 +94,12 @@ def dwa_velocity(pose, world_target, dt):
             cx, cy, ct = x, y, theta
             good = True
             min_clear = float("inf")
+            end_clear = float("inf")   # clearance at the LAST rollout cell (steering signal)
 
             # Pure in-place rotation (v == 0) never translates the robot into a
-            # wall, so it is always allowed — this is the robot's escape hatch
-            # when it is boxed in and every forward trajectory is blocked.
+            # wall, so it is always allowed.  (The reference DWA samples never
+            # include 0, so this is normally a no-op, but it keeps a boxed-in
+            # rotate-to-escape possible if a 0 sample is ever added.)
             translating = v > 1e-3
 
             for _ in range(DWA_ROLLOUT_STEPS):
@@ -74,25 +110,18 @@ def dwa_velocity(pose, world_target, dt):
                     continue
                 mx, my = mapping.world_to_map(cx, cy)
 
-                # Hard reject: rollout enters an obstacle cell.
-                if mapping.there_is_obstacle((mx, my)):
+                # Off the map, or centre inside an obstacle cell (clearance 0):
+                # hard reject — the robot must stay on the bounded, mapped area.
+                if not (0 <= mx < map_w and 0 <= my < map_h):
                     good = False
                     break
-
-                # Nearest obstacle in a 5x5 neighbourhood (Manhattan) — reaches
-                # the 3-cell body radius used for the hard-reject below.
-                local_min = float("inf")
-                for dx in range(-2, 3):
-                    for dy in range(-2, 3):
-                        if mapping.there_is_obstacle((mx + dx, my + dy)):
-                            local_min = min(local_min, abs(dx) + abs(dy))
-
-                # Hard reject: the robot body would clip a wall (keep a radius buffer).
-                if local_min <= DWA_ROBOT_RADIUS_PX:
+                clear_px = float(dist_field[my, mx])
+                if clear_px < 1.0:
                     good = False
                     break
-                if local_min < min_clear:
-                    min_clear = local_min
+                if clear_px < min_clear:
+                    min_clear = clear_px
+                end_clear = clear_px    # overwritten each step -> holds the final cell's clearance
 
             if not good:
                 continue
@@ -109,6 +138,17 @@ def dwa_velocity(pose, world_target, dt):
                      + DWA_SPEED_WEIGHT * speed_score
                      + DWA_CLEARANCE_WEIGHT * clearance_score)
 
+            # Body-clip penalty on the ENDPOINT clearance (not the rollout min).
+            # The first rollout step is always at the robot's current position, so
+            # a min-over-rollout penalty is pinned by where the robot already is
+            # and is identical for every w -> no steering gradient.  The endpoint
+            # clearance DOES differ by steering direction (turning away from a wall
+            # ends further from it), so penalising it makes DWA prefer the
+            # trajectory that curves back toward corridor centre.  Soft, not a
+            # reject: in a uniformly tight corridor the least-bad move still wins.
+            if end_clear != float("inf") and end_clear < DWA_ROBOT_CLEAR_PX:
+                score -= DWA_CLEAR_PENALTY * (DWA_ROBOT_CLEAR_PX - end_clear)
+
             if score > best_score:
                 best_score = score
                 best_v = v
@@ -119,22 +159,39 @@ def dwa_velocity(pose, world_target, dt):
 
 # ── Step-wise path follower ───────────────────────────────────────────────────
 
+def _reset_recovery():
+    global _recover_ticks, _recover_count, _prog_ref, _prog_ticks
+    _recover_ticks = 0
+    _recover_count = 0
+    _prog_ref = None
+    _prog_ticks = 0
+
+
 def set_path(path):
     """Load a path (list of (x, y) map cells) and reset follow state."""
-    global _path, _target_index, _stuck_last_pos, _stuck_count
+    global _path, _target_index
     _path = list(path) if path else None
     _target_index = min(FOLLOW_WAYPOINT_STRIDE, len(_path) - 1) if _path else 0
-    _stuck_last_pos = None
-    _stuck_count = 0
+    _reset_recovery()
 
 
 def reset():
     """Clear the follower state (no active path)."""
-    global _path, _target_index, _stuck_last_pos, _stuck_count
+    global _path, _target_index
     _path = None
     _target_index = 0
-    _stuck_last_pos = None
-    _stuck_count = 0
+    _reset_recovery()
+
+
+def _rear_clear(pose):
+    """True if the map shows no obstacle just behind the robot (safe to reverse)."""
+    x, y, theta = pose
+    for d in (0.06, 0.12, 0.18):
+        bx = x - d * math.cos(theta)
+        by = y - d * math.sin(theta)
+        if mapping.there_is_obstacle(mapping.world_to_map(bx, by)):
+            return False
+    return True
 
 
 def has_path():
@@ -149,9 +206,9 @@ def current_path():
 def step(pose, dt):
     """Advance one control tick.  Returns (v, omega, status).
 
-    status is one of: "following", "done", "stuck", "idle".
+    status is one of: "following", "recovering", "done", "stuck", "idle".
     """
-    global _target_index, _stuck_last_pos, _stuck_count
+    global _target_index, _recover_ticks, _recover_count, _prog_ref, _prog_ticks
 
     if not _path:
         return 0.0, 0.0, "idle"
@@ -160,30 +217,54 @@ def step(pose, dt):
     robot_cell = mapping.world_to_map(x, y)
 
     # Reached the final goal?
-    if _map_dist(robot_cell, _path[-1]) < PATH_FOLLOWING_TARGET_REACH_DIST_PX:
+    goal_dist = _map_dist(robot_cell, _path[-1])
+    if goal_dist < PATH_FOLLOWING_TARGET_REACH_DIST_PX:
         return 0.0, 0.0, "done"
 
-    # Advance the active waypoint past any already-reached ones.
+    # ── Progress watchdog: are we getting CLOSER to the goal? ──────────────────
+    # Measuring goal-distance closed (not raw movement) means a legitimate pivot
+    # or curve isn't mistaken for a stall, while a real corner-stall still fires.
+    if _prog_ref is None:
+        _prog_ref = goal_dist
+    _prog_ticks += 1
+    if _prog_ticks >= FOLLOW_PROGRESS_WIN:
+        closed = _prog_ref - goal_dist
+        _prog_ref = goal_dist
+        _prog_ticks = 0
+        if closed >= FOLLOW_MIN_PROGRESS_CELLS:
+            _recover_count = 0
+        else:
+            _recover_count += 1
+            if _recover_count > FOLLOW_MAX_RECOVERS:
+                return 0.0, 0.0, "stuck"          # give up -> caller replans
+            _recover_ticks = FOLLOW_RECOVER_STEPS  # back out decisively and retry
+
+    # Recovery maneuver in progress: back out (arc reverse if rear clear) + turn.
+    if _recover_ticks > 0:
+        _recover_ticks -= 1
+        if _rear_clear(pose):
+            return FOLLOW_RECOVER_VEL, FOLLOW_RECOVER_OMEGA, "recovering"
+        return 0.0, FOLLOW_RECOVER_OMEGA, "recovering"
+
+    # AURE follower: lock onto a FIXED waypoint until it is reached, then step
+    # ahead by the stride.  A stable target (not re-picked every tick) is what
+    # lets DWA drive straight at the path instead of hunting a moving carrot.
     while (_target_index < len(_path) - 1
            and _map_dist(robot_cell, _path[_target_index]) < PATH_FOLLOWING_TARGET_REACH_DIST_PX):
         _target_index += FOLLOW_WAYPOINT_STRIDE
     _target_index = min(_target_index, len(_path) - 1)
 
-    # Stuck detection: no meaningful progress for N ticks.  Rotating in place
-    # counts as progress (the robot is actively turning to escape / re-aim),
-    # so a long turn isn't mistaken for being stuck.
-    if _stuck_last_pos is not None:
-        moved = math.hypot(x - _stuck_last_pos[0], y - _stuck_last_pos[1])
-        turned = abs(_wrap(theta - _stuck_last_pos[2]))
-        if moved < FOLLOW_STUCK_MOVE_M and turned < FOLLOW_STUCK_TURN_RAD:
-            _stuck_count += 1
-            if _stuck_count >= FOLLOW_STUCK_STEPS:
-                return 0.0, 0.0, "stuck"
-        else:
-            _stuck_count = 0
-    _stuck_last_pos = (x, y, theta)
-
     target = _path[_target_index]
     world_target = mapping.map_to_world(target[0], target[1])
+
+    # Pure DWA tracking (as in the reference follow_local_target): no in-place
+    # pivot — the wide angular sample set arcs even sharp turns while moving,
+    # which is what keeps the motion smooth.
     v, w = dwa_velocity(pose, world_target, dt)
+
+    # DWA boxed (v=w=0): target behind a wall discovered after planning -> back out.
+    if abs(v) < 1e-3 and abs(w) < 1e-3:
+        _recover_ticks = FOLLOW_RECOVER_STEPS
+        return (FOLLOW_RECOVER_VEL if _rear_clear(pose) else 0.0), FOLLOW_RECOVER_OMEGA, "recovering"
+
     return v, w, "following"
