@@ -606,9 +606,12 @@ def handle_frontier_exploration(count):
         frontier_regions = detect_frontiers(mapping.get_grid())
 
         chosen_frontier = select_frontier_target(frontier_regions)
-        print(count, "--==--Scored frontier---")
 
         if chosen_frontier:
+            # Log only when the target changes — biased selection runs every tick,
+            # so printing on every call would flood the console.
+            if chosen_frontier != _current_goal:
+                print(f"[EXPLORE] scored frontier {chosen_frontier} (iter {count})")
             _current_goal = chosen_frontier
             path_to_frontier = planning.plan_frontier(tuple(_get_map_position()), chosen_frontier)
             if path_to_frontier:
