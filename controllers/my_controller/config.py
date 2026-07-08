@@ -23,6 +23,18 @@ OVERHEAD_DETECT_DIST = 1.00  # m — depth ROI max range for floating obstacles
 OVERHEAD_MARK_ENABLED = True
 OVERHEAD_MARK_MIN_PIXELS = 8   # min valid depth pixels in the overhead band before marking (reject noise)
 
+# Height gate for floating-wall marking: some floating walls sit high enough
+# that the robot can drive underneath; others sit low enough to hit the body.
+# These are DEDICATED to the overhead/floating-wall height math -- kept
+# separate from GREEN_CAM_HEIGHT_M / GREEN_CAM_X_OFFSET (the ground-projection
+# constants) even though it is physically the same depth camera, so the two
+# features can be tuned independently without touching each other.
+OVERHEAD_CAM_HEIGHT_M      = 0.17  # m — depth camera height above the floor (tune per robot)
+OVERHEAD_ROBOT_CLEARANCE_M = 0.20  # m — an obstacle point at/below this real-world height above
+                                   # the floor blocks the robot's body; above it, the gap under
+                                   # the floating wall is tall enough to drive through (tune to
+                                   # the robot's physical height + a small safety margin)
+
 # ── Caution zone speeds ───────────────────────────────────────────────────────
 CAUTION_LIN_VEL = 0.20  # m/s   — reduced forward speed in caution zone
 CAUTION_ANG_VEL = 0.12  # rad/s — steering rate in caution zone
