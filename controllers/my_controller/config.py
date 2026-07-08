@@ -17,6 +17,12 @@ FRONT_CAUTION_DIST = 0.35  # m — caution zone entry; slow down and steer
 # ── Overhead/floating obstacle depth safety ───────────────────────────────────
 OVERHEAD_DETECT_DIST = 1.00  # m — depth ROI max range for floating obstacles
 
+# Overhead-obstacle map marking (depth-camera ROI -> body-frame point -> grid,
+# mirrors GREEN_MARK_ENABLED/mark_green): lets a floating wall the lidar's scan
+# plane passes under still route the planner/DWA around it.
+OVERHEAD_MARK_ENABLED = True
+OVERHEAD_MARK_MIN_PIXELS = 8   # min valid depth pixels in the overhead band before marking (reject noise)
+
 # ── Caution zone speeds ───────────────────────────────────────────────────────
 CAUTION_LIN_VEL = 0.20  # m/s   — reduced forward speed in caution zone
 CAUTION_ANG_VEL = 0.12  # rad/s — steering rate in caution zone

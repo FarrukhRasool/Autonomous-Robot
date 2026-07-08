@@ -28,7 +28,7 @@ from config import (
     TARGET_LIN_VEL, TARGET_ANG_VEL, FRONT_STOP_DIST,
     POSE_LOG_PERIOD_STEPS,
     SLAM_GREEN_PERIOD_STEPS,
-    VIZ_PERIOD_STEPS, GREEN_MARK_ENABLED, FOLLOW_MAX_RETRIES,
+    VIZ_PERIOD_STEPS, GREEN_MARK_ENABLED, OVERHEAD_MARK_ENABLED, FOLLOW_MAX_RETRIES,
 )
 
 # ── Controller state ───────────────────────────────────────────────────────────
@@ -95,6 +95,17 @@ while devices.robot.step(devices.timestep) != -1:
         green_pts = sensors.green_ground_points_body()
         if len(green_pts) > 0:
             mapping.mark_green((robot_x, robot_y, robot_theta), green_pts)
+
+    # Overhead/floating-wall marking (depth-camera based): a floating wall sits
+    # above the lidar's scan plane, so project the depth ROI to the floor and
+    # stamp it as a hard obstacle (CELL_CLOSED) so the planner/DWA route around it.
+    if (not reset_this_step
+            and OVERHEAD_MARK_ENABLED
+            and step_count % SLAM_GREEN_PERIOD_STEPS == 0
+            and not motion.is_turning()):
+        overhead_pts = sensors.overhead_obstacle_points_body()
+        if len(overhead_pts) > 0:
+            mapping.mark_overhead((robot_x, robot_y, robot_theta), overhead_pts)
 
     # Keyboard edge detection: new_keys fires only on the step a key first appears
     pressed_now = set()

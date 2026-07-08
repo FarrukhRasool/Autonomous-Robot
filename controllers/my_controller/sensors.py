@@ -18,6 +18,7 @@ from config import (
     GREEN_HSV_LOWER, GREEN_HSV_UPPER,
     COLUMN_HEIGHT_CM, COLUMN_DIST_OFFSET_CM, COLUMN_TOP_STRIP_PX,
     GREEN_CAM_HEIGHT_M, GREEN_CAM_X_OFFSET, GREEN_MAX_PROJ_DIST, GREEN_MARK_MIN_PIXELS,
+    OVERHEAD_DETECT_DIST, OVERHEAD_MARK_MIN_PIXELS,
 )
 
 
@@ -176,6 +177,20 @@ def _read_rgb_fov():
 
 # Cached at import time — RGB camera FOV does not change at runtime.
 _rgb_fov = _read_rgb_fov()
+
+
+def _read_depth_fov():
+    if devices.camera_depth is None:
+        return None
+    try:
+        fov = devices.camera_depth.getFov()
+    except Exception:
+        return None
+    return fov if fov is not None and math.isfinite(fov) else None
+
+
+# Cached at import time — depth camera FOV does not change at runtime.
+_depth_fov = _read_depth_fov()
 
 
 def _read_scalar(sensor):
@@ -361,6 +376,48 @@ def _read_depth_center():
         return None
     return w, h, data[h // 2 * w + w // 2]
 
+# Upper-frame depth ROIs shared by overhead_depth_regions(),
+# overhead_depth_region_values(), and overhead_obstacle_points_body() — a
+# floating wall sits above the lidar's scan plane, so these are the only
+# sensor evidence of it.
+_OVERHEAD_ROIS = {
+    "left":   (0.05, 0.40, 0.02, 0.55),
+    "center": (0.25, 0.75, 0.02, 0.55),
+    "right":  (0.60, 0.95, 0.02, 0.55),
+}
+
+# Overhead band for the PER-PIXEL projection (overhead_obstacle_points_body):
+# the union of the three ROIs above (cols 0.05-0.95, rows 0.02-0.55).  Unlike
+# the coarse per-ROI "near" scalar used by the two functions above, every
+# pixel in this band keeps its OWN column's bearing, so the projected point
+# lines up with the pixel it actually came from instead of a shared
+# ROI-centre bearing (which put points at the wrong angle -- see
+# overhead_obstacle_points_body's docstring).
+_OVERHEAD_BAND_COL_FRAC = (0.05, 0.95)
+_OVERHEAD_BAND_ROW_FRAC = (0.02, 0.55)
+
+
+def _overhead_roi_near_depth(data, w, h, x0f, x1f, y0f, y1f):
+    """Robust (5th-percentile) nearest valid depth (m) within one ROI, or inf."""
+    col_start = int(x0f * w)
+    col_end   = int(x1f * w)
+    row_start = int(y0f * h)
+    row_end   = int(y1f * h)
+
+    vals = []
+    for row in range(row_start, row_end, 3):
+        base = row * w
+        for col in range(col_start, col_end, 3):
+            v = data[base + col]
+            if math.isfinite(v) and v > GREEN_DEPTH_MIN_VALID:
+                vals.append(v)
+
+    if not vals:
+        return INF
+    vals.sort()
+    return vals[max(0, len(vals) // 20)]  # 5th percentile
+
+
 def overhead_depth_regions(max_distance):
     """Detect overhead/floating obstacles in upper-left, upper-center, upper-right depth ROIs.
 
@@ -373,42 +430,18 @@ def overhead_depth_regions(max_distance):
     if data is None:
         return False, "none", INF
 
-    rois = {
-        "left":   (0.05, 0.40, 0.02, 0.55),
-        "center": (0.25, 0.75, 0.02, 0.55),
-        "right":  (0.60, 0.95, 0.02, 0.55),
-    }
-
     best_region = "none"
     best_depth = INF
 
-    for name, (x0f, x1f, y0f, y1f) in rois.items():
-        col_start = int(x0f * w)
-        col_end   = int(x1f * w)
-        row_start = int(y0f * h)
-        row_end   = int(y1f * h)
-
-        vals = []
-
-        for row in range(row_start, row_end, 3):
-            base = row * w
-            for col in range(col_start, col_end, 3):
-                v = data[base + col]
-                if math.isfinite(v) and v > GREEN_DEPTH_MIN_VALID:
-                    vals.append(v)
-
-        if not vals:
-            continue
-
-        vals.sort()
-        depth_near = vals[max(0, len(vals) // 20)]  # 5th percentile
-
+    for name, roi in _OVERHEAD_ROIS.items():
+        depth_near = _overhead_roi_near_depth(data, w, h, *roi)
         if depth_near < best_depth:
             best_depth = depth_near
             best_region = name
 
     detected = best_depth < max_distance
     return detected, best_region, best_depth
+
 
 def overhead_depth_region_values():
     """Return robust depth values for overhead left/center/right ROIs.
@@ -424,37 +457,67 @@ def overhead_depth_region_values():
             "overhead_right": INF,
         }
 
-    rois = {
-        "overhead_left":   (0.05, 0.40, 0.02, 0.55),
-        "overhead_center": (0.25, 0.75, 0.02, 0.55),
-        "overhead_right":  (0.60, 0.95, 0.02, 0.55),
+    return {
+        f"overhead_{name}": _overhead_roi_near_depth(data, w, h, *roi)
+        for name, roi in _OVERHEAD_ROIS.items()
     }
 
-    result = {}
 
-    for name, (x0f, x1f, y0f, y1f) in rois.items():
-        col_start = int(x0f * w)
-        col_end   = int(x1f * w)
-        row_start = int(y0f * h)
-        row_end   = int(y1f * h)
+def overhead_obstacle_points_body():
+    """Project nearby floating/overhead obstacles onto the floor as body-frame
+    points, for marking into the occupancy grid (mapping.mark_overhead).
 
-        vals = []
+    Per-pixel projection over the overhead band (_OVERHEAD_BAND_*): every
+    valid depth pixel within OVERHEAD_DETECT_DIST is converted to a body-frame
+    (x_forward, y_left) point using the SAME pinhole-ray decomposition as
+    green_ground_points_body (fx/x_norm/y_norm, "square pixels" -> fy == fx),
+    except the measured depth is used directly as the ray length (unlike the
+    ground projection, which instead assumes the point lies on a KNOWN-height
+    floor plane) -- a floating obstacle's height is unknown, so its range must
+    be decomposed geometrically via the pixel's own (x_norm, y_norm) instead.
 
-        for row in range(row_start, row_end, 3):
-            base = row * w
-            for col in range(col_start, col_end, 3):
-                v = data[base + col]
-                if math.isfinite(v) and v > GREEN_DEPTH_MIN_VALID:
-                    vals.append(v)
+    This must NOT be simplified to a single "nearest depth in the ROI" + a
+    shared ROI-centre bearing: the nearest pixel can sit anywhere across the
+    ~30%-wide ROI, and ignoring the vertical angle over-estimates the forward
+    range for off-centre rows -- both put the point well off the obstacle's
+    true position, scattering marks across the map instead of tracing its true
+    shape (as lidar rasterization does by using each ray's own angle).  Points
+    are subsampled for cost.  Returns an (N, 2) array; empty (0, 2) when too
+    few pixels qualify or the depth camera is unavailable.
+    """
+    empty = np.empty((0, 2), dtype=np.float64)
+    data, w, h = _read_depth_image()
+    if data is None or _depth_fov is None:
+        return empty
 
-        if not vals:
-            result[name] = INF
-            continue
+    depth = np.asarray(data, dtype=np.float64).reshape((h, w))
+    col0 = int(_OVERHEAD_BAND_COL_FRAC[0] * w)
+    col1 = int(_OVERHEAD_BAND_COL_FRAC[1] * w)
+    row0 = int(_OVERHEAD_BAND_ROW_FRAC[0] * h)
+    row1 = int(_OVERHEAD_BAND_ROW_FRAC[1] * h)
 
-        vals.sort()
-        result[name] = vals[max(0, len(vals) // 20)]  # 5th percentile
+    band = depth[row0:row1, col0:col1]
+    valid = np.isfinite(band) & (band > GREEN_DEPTH_MIN_VALID) & (band < OVERHEAD_DETECT_DIST)
+    rows, cols = np.where(valid)
+    if rows.size < OVERHEAD_MARK_MIN_PIXELS:
+        return empty
+    if rows.size > 400:
+        idx = np.linspace(0, rows.size - 1, 400).astype(int)
+        rows, cols = rows[idx], cols[idx]
 
-    return result
+    d = band[rows, cols]
+    cols_full = cols + col0                      # back to full-image indices
+    rows_full = rows + row0
+
+    fx = w / (2.0 * math.tan(_depth_fov / 2.0))
+    cx, cy = w / 2.0, h / 2.0
+    x_norm = (cols_full - cx) / fx
+    y_norm = (rows_full - cy) / fx
+    ray_norm = np.sqrt(x_norm ** 2 + y_norm ** 2 + 1.0)
+
+    bx = d / ray_norm                 # forward
+    by = -d * x_norm / ray_norm       # left (+) / right (-)
+    return np.stack([bx, by], axis=1)
 
 
 def get_front_laser_min():
