@@ -208,10 +208,24 @@ def _grid_from_log_odds(log_odds, prev_grid):
     green_mask = (prev_grid == CELL_GREEN)
     blue_mask = (prev_grid == CELL_BLUE)
     yellow_mask = (prev_grid == CELL_YELLOW)
-    protected = closed_mask | green_mask | blue_mask | yellow_mask
+
+    # Lidar override: a CELL_CLOSED (overhead-marked "floating wall") cell is
+    # normally protected from sensor updates -- but lidar physically CANNOT see
+    # a genuine floating wall at all (it sits outside the scan plane), so if
+    # lidar-derived log-odds independently confirms occupancy here (P > P_OCC),
+    # this was never a floating wall -- it's an ordinary wall the overhead band
+    # also happened to touch, mismarked before lidar had accumulated enough
+    # evidence.  Let lidar win and demote it to a normal CELL_OCC cell, whether
+    # that confirmation lands before OR after the overhead mark.  A REAL
+    # floating wall's footprint stays FREE under lidar (the beam passes clean
+    # through underneath it), so it never crosses P_OCC and is unaffected.
+    closed_lidar_confirmed = closed_mask & (P > P_OCC)
+    closed_still_protected = closed_mask & ~closed_lidar_confirmed
+
+    protected = closed_still_protected | green_mask | blue_mask | yellow_mask
 
     unknown_mask = (log_odds == LOGODDS_INIT) & (~protected)
-    obstacle_mask = (P > P_OCC) & (~protected)
+    obstacle_mask = (P > P_OCC) & (~protected)   # includes closed_lidar_confirmed
     free_mask = (P < P_FREE) & (~protected)
 
     new_grid = np.empty_like(prev_grid)
@@ -223,7 +237,7 @@ def _grid_from_log_odds(log_odds, prev_grid):
     new_grid[other] = prev_grid[other]
     # Restore protected cells so sensor updates never erase them.
     new_grid[green_mask] = CELL_GREEN
-    new_grid[closed_mask] = CELL_CLOSED
+    new_grid[closed_still_protected] = CELL_CLOSED
     new_grid[blue_mask] = CELL_BLUE
     new_grid[yellow_mask] = CELL_YELLOW
     return new_grid
@@ -276,6 +290,16 @@ def mark_overhead(pose, points_local):
     dedicated pillar colour must win over a generic obstacle mark so FR4's
     blue/yellow targets stay visible on the map instead of blending into the
     walls.
+
+    Lidar cross-check: a cell the lidar has already confirmed as CELL_OCC is
+    ALSO left alone.  Lidar cannot see a genuine floating wall at all (it sits
+    outside the scan plane), so if lidar independently sees an obstacle at the
+    same spot, this is an ordinary floor-to-ceiling wall the overhead band just
+    happened to also pick up -- stamping CELL_CLOSED over it would be a
+    redundant, uninflated overlay on an already-correct wall (CELL_CLOSED is
+    deliberately excluded from planning's inflation pass, so overlapping it
+    onto a CELL_OCC wall can leave a thin gap in that wall's safety margin
+    right at the overlap, which is worse than just leaving CELL_OCC alone).
     """
     if pose is None or points_local is None:
         return
@@ -288,7 +312,7 @@ def mark_overhead(pose, points_local):
         new_grid = _grid.copy()
         for mx, my in map_points:
             if (0 <= mx < MAP_SIZE and 0 <= my < MAP_SIZE
-                    and new_grid[my, mx] not in (CELL_BLUE, CELL_YELLOW)):
+                    and new_grid[my, mx] not in (CELL_BLUE, CELL_YELLOW, CELL_OCC)):
                 new_grid[my, mx] = CELL_CLOSED
         _grid = new_grid
 
