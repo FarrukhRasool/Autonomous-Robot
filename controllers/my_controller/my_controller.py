@@ -28,7 +28,7 @@ from config import (
     TARGET_LIN_VEL, TARGET_ANG_VEL, FRONT_STOP_DIST,
     POSE_LOG_PERIOD_STEPS,
     SLAM_GREEN_PERIOD_STEPS,
-    VIZ_PERIOD_STEPS, GREEN_MARK_ENABLED, FOLLOW_MAX_RETRIES,
+    VIZ_PERIOD_STEPS, GREEN_MARK_ENABLED, OVERHEAD_MARK_ENABLED, FOLLOW_MAX_RETRIES,
 )
 
 # ── Controller state ───────────────────────────────────────────────────────────
@@ -95,6 +95,20 @@ while devices.robot.step(devices.timestep) != -1:
         green_pts = sensors.green_ground_points_body()
         if len(green_pts) > 0:
             mapping.mark_green((robot_x, robot_y, robot_theta), green_pts)
+    if (not reset_this_step
+            and OVERHEAD_MARK_ENABLED
+            and step_count % SLAM_GREEN_PERIOD_STEPS == 0
+            and not motion.is_turning()):
+        overhead_pts = sensors.overhead_obstacle_points_body()
+        if len(overhead_pts) > 0:
+            mapping.mark_overhead((robot_x, robot_y, robot_theta), overhead_pts)
+
+    # ── Pillar perception: recognize + colour-tag blue/yellow pillar cells on
+    # the map, independent of which mode is driving (teleop/G/Y) -- Explore
+    # (E) and Mission (X) block this outer loop while running, so they call
+    # perception.tag_pillars_on_map from their own internal tick loops instead.
+    if not reset_this_step:
+        perception.tag_pillars_on_map()
 
     # Keyboard edge detection: new_keys fires only on the step a key first appears
     pressed_now = set()
