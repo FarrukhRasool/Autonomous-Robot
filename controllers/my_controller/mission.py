@@ -225,7 +225,15 @@ def _drive_to(color, should_continue):
             return False
 
         goal_cell = _approach_cell(localization.get_pose(), world)
-        route = planning.plan(tuple(exploration._get_map_position()), goal_cell)
+        # Route THROUGH unknown space (block_unknown=False), like the frontier
+        # planner.  The traceback to a KNOWN/marked pillar (blue->yellow) crosses
+        # cells the robot never mapped on its winding way out; the default goal-run
+        # mode makes every unknown cell a wall, so A* finds no route and the drive
+        # gives up instantly (the "retrying drive" spam that ends in "stopped before
+        # reaching yellow").  Real obstacles in the unmapped stretch are handled by
+        # the governor / bumper / recovery as the robot advances.
+        route = planning.plan(tuple(exploration._get_map_position()), goal_cell,
+                              block_unknown=False)
         if not route or len(route) < 2:
             # Can't plan a path -- if we're already confirmed at the pillar, win.
             colors = sensors.read_color_detections()
@@ -330,10 +338,16 @@ def _seek_and_reach(color, should_continue):
         if _drive_to(color, should_continue):
             return True
 
-        # Arrived at the remembered spot but not actually at the pillar -> the
-        # sighting was stale/imprecise; forget it and look again.
-        print(f"[MISSION] {color} not reached at remembered spot -> re-acquiring")
-        perception.forget_target(color)
+        # Don't discard a pillar we've already MARKED (reached + colour-stamped on
+        # the map): its position is known-good, so forgetting it and re-exploring is
+        # the robot wandering with the pillar already on the map.  Keep the position
+        # and retry the drive.  Only a never-confirmed (far-glimpsed, unregistered)
+        # pillar is forgotten as a stale sighting and re-acquired by exploration.
+        if _registered[color]:
+            print(f"[MISSION] {color} not reached -> retrying drive (keeping marked position)")
+        else:
+            print(f"[MISSION] {color} not reached at remembered spot -> re-acquiring")
+            perception.forget_target(color)
         attempts += 1
         if attempts > 6:
             return False
