@@ -301,7 +301,6 @@ while devices.robot.step(devices.timestep) != -1:
 
         def _mission_should_continue():
             if viz_on:
-                pcs = mission.pillar_cells()
                 goal = exploration.current_goal()
                 visualizer.render(
                     mapping.get_grid(),
@@ -312,8 +311,6 @@ while devices.robot.step(devices.timestep) != -1:
                     path=(mission.current_path()
                           or following.current_path()
                           or exploration.current_path()),
-                    blue_cell=pcs["blue"],
-                    yellow_cell=pcs["yellow"],
                 )
             keys = set()
             kk = devices.keyboard.getKey()
