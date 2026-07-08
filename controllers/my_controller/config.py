@@ -149,6 +149,16 @@ DWA_CLEARANCE_WEIGHT = 2.0   # reward staying away from obstacles
 # below the robot's half-width.
 DWA_ROBOT_CLEAR_PX   = 3.0   # robot half-width in cells (~0.10 m); keep this much wall clearance
 DWA_CLEAR_PENALTY    = 4.0   # score penalty per cell of encroachment below DWA_ROBOT_CLEAR_PX
+# Live-lidar speed governor: DWA only avoids MAPPED obstacles, so while exploring
+# UNKNOWN space (treated as free) the robot charges unmapped walls at full speed
+# until the binary bumper trips too late -> ram/reverse/replan thrash.  Scale the
+# commanded forward speed by the live front-lidar clearance so it decelerates
+# smoothly into ANY obstacle (mapped or not) before the bumper, and the extra slow
+# ticks let the map register the wall so DWA can steer around it.  Turning (w) is
+# never governed, so it can still rotate toward an opening while slowed.
+FOLLOW_GOVERNOR_FULL_M = 0.45  # front clearance (m) at/above which full speed is allowed
+FOLLOW_GOVERNOR_MIN_M  = 0.15  # front clearance (m) at/below which forward speed is cut to 0
+FOLLOW_GOVERNOR_ARC_DEG = 25   # half-arc (deg) of the front lidar cone the governor watches
 
 PATH_FOLLOWING_TARGET_REACH_DIST_PX = 4   # px — waypoint considered reached within this
 FOLLOW_WAYPOINT_STRIDE = 5                # step ahead this many waypoints once one is reached (AURE)

@@ -8,4 +8,4 @@ orthographicViewHeight: 1
 textFiles: -1
 consoles: Console:All:All
 renderingDevicePerspectives: rosbot:camera depth;0;0.596875;0;0
-renderingDevicePerspectives: rosbot:camera rgb;1;0.396875;0.727273;0
+renderingDevicePerspectives: rosbot:camera rgb;1;0.324147;0.727273;0
