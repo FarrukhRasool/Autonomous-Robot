@@ -211,15 +211,19 @@ def plan(start_cell, goal_cell, grid=None, block_unknown=None, inflation_levels=
         green_mask = (work == CELL_GREEN)
         unknown_mask = (work == CELL_UNKNOWN)
 
-        # Don't inflate closures/green: closures free during inflation, green hard.
-        work[closed_mask] = CELL_FREE
+        # Closures (floating walls) and green get the SAME hard-obstacle
+        # treatment as ordinary lidar-seen walls: marked OCC before inflation
+        # so they receive the identical dilation safety margin, instead of a
+        # bare, un-inflated single-cell block a path could run flush against.
+        work[closed_mask] = CELL_OCC
         work[green_mask] = CELL_OCC
 
         work = _clean_small_components(work.astype(np.uint8), min_size=6, connectivity=4)
         work = _remove_noisy_pixels(work, connectivity=4)   # -> binary 0/1
         work = _inflate_obstacles(work, inflation)          # -> binary 0/1
 
-        # Re-apply closures/green as hard obstacles after inflation.
+        # Re-apply closures/green as hard obstacles after inflation (in case
+        # cleanup/binary conversion dropped a small isolated patch).
         work[closed_mask] = CELL_OCC
         work[green_mask] = CELL_OCC
 
