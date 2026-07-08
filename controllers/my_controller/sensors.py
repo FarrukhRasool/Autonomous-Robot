@@ -19,6 +19,7 @@ from config import (
     COLUMN_HEIGHT_CM, COLUMN_DIST_OFFSET_CM, COLUMN_TOP_STRIP_PX,
     GREEN_CAM_HEIGHT_M, GREEN_CAM_X_OFFSET, GREEN_MAX_PROJ_DIST, GREEN_MARK_MIN_PIXELS,
     OVERHEAD_DETECT_DIST, OVERHEAD_MARK_MIN_PIXELS,
+    OVERHEAD_CAM_HEIGHT_M, OVERHEAD_ROBOT_CLEARANCE_M,
 )
 
 
@@ -482,8 +483,17 @@ def overhead_obstacle_points_body():
     range for off-centre rows -- both put the point well off the obstacle's
     true position, scattering marks across the map instead of tracing its true
     shape (as lidar rasterization does by using each ray's own angle).  Points
-    are subsampled for cost.  Returns an (N, 2) array; empty (0, 2) when too
-    few pixels qualify or the depth camera is unavailable.
+    are subsampled for cost.
+
+    Height gate: some floating walls sit high enough that the robot can drive
+    underneath; only points whose real-world height above the floor is at/below
+    OVERHEAD_ROBOT_CLEARANCE_M are kept (those actually block the robot's
+    body).  Height is recovered from the same pinhole ray (OVERHEAD_CAM_HEIGHT_M
+    minus the ray's vertical rise), not assumed from image row alone, so it
+    differentiates a genuinely low wall from one whose gap the robot clears.
+
+    Returns an (N, 2) array; empty (0, 2) when too few pixels qualify, none
+    are low enough to block, or the depth camera is unavailable.
     """
     empty = np.empty((0, 2), dtype=np.float64)
     data, w, h = _read_depth_image()
@@ -517,6 +527,16 @@ def overhead_obstacle_points_body():
 
     bx = d / ray_norm                 # forward
     by = -d * x_norm / ray_norm       # left (+) / right (-)
+
+    # Height above the floor at each point: camera mount height minus the
+    # ray's vertical rise (y_norm < 0 above the optical centre -> positive
+    # rise -> point sits above camera height, as expected for "overhead").
+    height_above_floor = OVERHEAD_CAM_HEIGHT_M - d * y_norm / ray_norm
+    blocking = height_above_floor <= OVERHEAD_ROBOT_CLEARANCE_M
+    if not np.any(blocking):
+        return empty
+    bx = bx[blocking]
+    by = by[blocking]
     return np.stack([bx, by], axis=1)
 
 
