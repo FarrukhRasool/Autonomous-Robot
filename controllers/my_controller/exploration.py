@@ -44,6 +44,7 @@ from config import (
     EXPLORE_SCAN_TURN_TICKS, EXPLORE_SCAN_TURN_WHEEL, EXPLORE_FORGET_VISITED_EVERY,
     SLAM_GREEN_PERIOD_STEPS, GREEN_MARK_ENABLED,
     PILLAR_BIAS_WEIGHT, OBSTACLE_RECOVER_TURN_AFTER,
+    FOLLOW_GOVERNOR_FULL_M, FOLLOW_GOVERNOR_MIN_M, FOLLOW_GOVERNOR_ARC_DEG,
 )
 
 # ── Reference MyRobot state (the fields exploration touches) ──────────────────
@@ -187,6 +188,27 @@ def _get_lidar_front_min_dist(angle_range_deg=30):
     if len(front_distances) == 0:
         return float("inf")
     return float(np.min(front_distances))
+
+
+def _govern_speed(v):
+    """Scale a commanded forward speed by live front-lidar clearance.
+
+    DWA only avoids MAPPED obstacles, so in unknown space it commands full speed
+    straight at unmapped walls until the binary bumper trips too late.  This caps
+    v by what the lidar actually sees ahead: full above FOLLOW_GOVERNOR_FULL_M,
+    linearly down to 0 at FOLLOW_GOVERNOR_MIN_M (the bumper/recover own the last
+    ~0.10 m).  Only forward speed is governed — the caller's w is untouched, so the
+    robot can still rotate toward an opening while slowed.
+    """
+    if v <= 0.0:
+        return v
+    front = _get_lidar_front_min_dist(angle_range_deg=FOLLOW_GOVERNOR_ARC_DEG)
+    if not math.isfinite(front) or front >= FOLLOW_GOVERNOR_FULL_M:
+        return v
+    if front <= FOLLOW_GOVERNOR_MIN_M:
+        return 0.0
+    scale = (front - FOLLOW_GOVERNOR_MIN_M) / (FOLLOW_GOVERNOR_FULL_M - FOLLOW_GOVERNOR_MIN_M)
+    return v * scale
 
 
 def _obstacle_in_front():
@@ -520,6 +542,7 @@ def _follow_local_target(map_target):
     world_target = np.array(_convert_to_world_coordinates(map_target[0], map_target[1]))
     pose = localization.get_pose()
     v, w = following.dwa_velocity(pose, world_target, devices.timestep / 1000.0)
+    v = _govern_speed(v)          # live-lidar brake so we don't charge unmapped walls
     motion.drive_twist(v, w)
     return False, False
 
