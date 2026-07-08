@@ -20,7 +20,8 @@ OVERHEAD_DETECT_DIST = 1.00  # m — depth ROI max range for floating obstacles
 # Overhead-obstacle map marking (depth-camera ROI -> body-frame point -> grid,
 # mirrors GREEN_MARK_ENABLED/mark_green): lets a floating wall the lidar's scan
 # plane passes under still route the planner/DWA around it.
-OVERHEAD_MARK_ENABLED = True
+OVERHEAD_MARK_ENABLED = False  # TEMP: A/B test — disabled to isolate whether depth-based CELL_CLOSED
+                               # marking is causing the replan/reverse thrash.  Re-enable once confirmed.
 OVERHEAD_MARK_MIN_PIXELS = 8   # min valid depth pixels in the overhead band before marking (reject noise)
 
 # ── Caution zone speeds ───────────────────────────────────────────────────────
