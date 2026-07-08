@@ -133,8 +133,12 @@ def _perceive(colors=None):
         dist = colors.get(f"{color}_distance_m", float("inf"))
         if bearing is None or not math.isfinite(dist):
             continue
-        # Localize (for navigation direction) on every sighting, any distance.
-        perception.update_target_memory(color, pose, bearing, dist)
+        # Localize (for navigation direction) with the camera-depth sighting only
+        # UNTIL the pillar is registered.  Once it's marked, the memory is frozen at
+        # the accurate stamped (laser) position below, so stop letting noisy depth
+        # sightings drift it — that frozen position is what backtracking uses.
+        if not _registered[color]:
+            perception.update_target_memory(color, pose, bearing, dist)
         if not _seen[color]:
             print(f"[MISSION] {color} column spotted (dist~{dist:.2f} m) — approaching to confirm")
             _seen[color] = True
@@ -147,6 +151,10 @@ def _perceive(colors=None):
             world = perception.target_world_position(pose, bearing, stamp_d)
             if world is not None:
                 mapping.mark_pillar(mapping.world_to_map(world[0], world[1]), color)
+                # Remember THIS stamped position for backtracking — freeze the memory
+                # at the laser-based mark so it matches the map stamp (and the drawn
+                # circle) instead of the drifting depth sighting.
+                perception.update_target_memory(color, pose, bearing, stamp_d)
             _registered[color] = True
             print(f"[MISSION] {color} pillar reached & marked on map "
                   f"(laser={fd:.2f} m, ratio={colors.get(f'{color}_ratio', 0):.3f})")
