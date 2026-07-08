@@ -165,7 +165,8 @@ DWA_CLEARANCE_WEIGHT = 2.0   # reward staying away from obstacles
 # no hard reject, so a genuinely tight corridor still yields the least-bad move
 # instead of a stuck refusal) any rollout whose clearance to a known wall drops
 # below the robot's half-width.
-DWA_ROBOT_CLEAR_PX   = 3.0   # robot half-width in cells (~0.10 m); keep this much wall clearance
+DWA_ROBOT_CLEAR_PX   = 4.0   # robot half-width in cells (~0.133 m); keep this much wall clearance
+                             # (bumped up from 3.0/~0.10 m for extra margin against clipping)
 DWA_CLEAR_PENALTY    = 4.0   # score penalty per cell of encroachment below DWA_ROBOT_CLEAR_PX
 # Live-lidar speed governor: DWA only avoids MAPPED obstacles, so while exploring
 # UNKNOWN space (treated as free) the robot charges unmapped walls at full speed
