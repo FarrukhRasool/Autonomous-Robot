@@ -44,6 +44,7 @@ from config import (
     EXPLORE_SCAN_TURN_TICKS, EXPLORE_SCAN_TURN_WHEEL, EXPLORE_FORGET_VISITED_EVERY,
     SLAM_GREEN_PERIOD_STEPS, GREEN_MARK_ENABLED,
     PILLAR_BIAS_WEIGHT, OBSTACLE_RECOVER_TURN_AFTER,
+    FOLLOW_GOVERNOR_FULL_M, FOLLOW_GOVERNOR_MIN_M, FOLLOW_GOVERNOR_ARC_DEG,
 )
 
 # ── Reference MyRobot state (the fields exploration touches) ──────────────────
@@ -60,10 +61,10 @@ _no_path_streak = 0           # consecutive iterations with no frontier/freespac
 _target_bias = None
 
 # follow_local_target stuck-detection state (reference __init__ values)
-_follow_last_position = None
-_follow_stuck_count = 0
-FOLLOW_POSITION_THRESHOLD = 0.005   # m — min movement to not be considered stuck
-FOLLOW_STUCK_THRESHOLD = 25         # calls without movement to consider stuck
+_follow_ref_dist = None             # goal distance (map cells) at the progress-window start
+_follow_stuck_count = 0             # ticks elapsed in the current progress window
+FOLLOW_MIN_PROGRESS_PX = 3          # cells the goal distance must shrink per window, else stuck
+FOLLOW_STUCK_THRESHOLD = 25         # window length (ticks) over which progress is measured
 
 # Consecutive obstacle recoveries without escaping — escalates to a turn (see
 # _recover_from_obstacle).  Reset when a new frontier follow starts / on reset.
@@ -152,14 +153,14 @@ def _there_is_obstacle(cell):
 
 def _turn_left_milisecond(s=200):
     """Reference turn_left_milisecond."""
-    _set_robot_velocity(-8, 8)
+    _set_robot_velocity(-4, 4)
     _tick(s)
     _stop_motor()
 
 
 def _turn_right_milisecond(s=200):
     """Reference turn_right_milisecond."""
-    _set_robot_velocity(8, -8)
+    _set_robot_velocity(4, -4)
     _tick(s)
     _stop_motor()
 
@@ -189,6 +190,27 @@ def _get_lidar_front_min_dist(angle_range_deg=30):
     return float(np.min(front_distances))
 
 
+def _govern_speed(v):
+    """Scale a commanded forward speed by live front-lidar clearance.
+
+    DWA only avoids MAPPED obstacles, so in unknown space it commands full speed
+    straight at unmapped walls until the binary bumper trips too late.  This caps
+    v by what the lidar actually sees ahead: full above FOLLOW_GOVERNOR_FULL_M,
+    linearly down to 0 at FOLLOW_GOVERNOR_MIN_M (the bumper/recover own the last
+    ~0.10 m).  Only forward speed is governed — the caller's w is untouched, so the
+    robot can still rotate toward an opening while slowed.
+    """
+    if v <= 0.0:
+        return v
+    front = _get_lidar_front_min_dist(angle_range_deg=FOLLOW_GOVERNOR_ARC_DEG)
+    if not math.isfinite(front) or front >= FOLLOW_GOVERNOR_FULL_M:
+        return v
+    if front <= FOLLOW_GOVERNOR_MIN_M:
+        return 0.0
+    scale = (front - FOLLOW_GOVERNOR_MIN_M) / (FOLLOW_GOVERNOR_FULL_M - FOLLOW_GOVERNOR_MIN_M)
+    return v * scale
+
+
 def _obstacle_in_front():
     """Reference obstacle_in_front: distance-sensor V-shape OR lidar bumper."""
     ds_distances = _get_distances()
@@ -206,10 +228,10 @@ def _obstacle_in_front():
 
 # ── Recovery (reference recover_from_stuck / recover_from_obstacle) ────────────
 
-def _recover_from_stuck(turn_duration=(400, 600)):
+def _recover_from_stuck(turn_duration=(800, 1200)):
     """Reference recover_from_stuck: reverse (length gated on rear clearance),
     settle, then turn a random direction/duration."""
-    _set_robot_velocity(-8, -8)
+    _set_robot_velocity(-5, -5)
     distances = _get_distances()
     if distances[1] > 0.25 and distances[3] > 0.25:
         print("reversing longer")
@@ -239,7 +261,7 @@ def _recover_from_stuck(turn_duration=(400, 600)):
             return False
 
 
-def _recover_from_obstacle(turn_duration=(400, 600)):
+def _recover_from_obstacle(turn_duration=(800, 1200)):
     """Reverse to back off a front obstacle, then settle.
 
     Two changes from the reference recover_from_obstacle (which reversed straight,
@@ -255,7 +277,7 @@ def _recover_from_obstacle(turn_duration=(400, 600)):
         change the re-approach heading.
     """
     global _obstacle_recover_streak
-    _set_robot_velocity(-8, -8)
+    _set_robot_velocity(-5, -5)
     distances = _get_distances()   # [fl, rl, fr, rr]
     if distances[1] > 0.25 and distances[3] > 0.25:   # rear-left AND rear-right clear
         print("reversing longer [recover from obstacle]")
@@ -495,31 +517,38 @@ def select_random_freespace_near_robot(radius=EXPLORE_FREESPACE_RADIUS_PX, max_t
 
 def _follow_local_target(map_target):
     """Reference follow_local_target -> (reached, is_stuck).  Drives DWA toward
-    map_target; flags stuck when the robot hasn't moved over repeated calls."""
-    global _follow_last_position, _follow_stuck_count
+    map_target; flags stuck when it stops making PROGRESS toward the target.
 
-    if _get_map_distance(map_target) < PATH_FOLLOWING_TARGET_REACH_DIST_PX:
-        _follow_last_position = None
+    Progress (goal distance shrinking), not per-tick movement, is the stuck test:
+    at a wall the governor zeroes forward speed while DWA keeps a turn, so the robot
+    wiggles/rotates in place — that per-tick motion kept resetting the old
+    'hasn't-moved' counter, so stuck never fired and the robot sat there forever.
+    Measuring goal-distance progress over a window catches that oscillation."""
+    global _follow_ref_dist, _follow_stuck_count
+
+    goal_dist = _get_map_distance(map_target)          # map cells
+    if goal_dist < PATH_FOLLOWING_TARGET_REACH_DIST_PX:
+        _follow_ref_dist = None
         _follow_stuck_count = 0
         return True, False
 
-    current_position = _get_position()
-    if _follow_last_position is not None:
-        distance_moved = np.linalg.norm(current_position - _follow_last_position)
-        if distance_moved < FOLLOW_POSITION_THRESHOLD:
-            _follow_stuck_count += 1
-            if _follow_stuck_count >= FOLLOW_STUCK_THRESHOLD:
-                _follow_stuck_count = 0
-                _follow_last_position = None
-                return False, True
-        else:
-            _follow_stuck_count = 0
-
-    _follow_last_position = current_position
+    # Progress watchdog: over FOLLOW_STUCK_THRESHOLD ticks the goal distance must
+    # shrink by at least FOLLOW_MIN_PROGRESS_PX cells, else the follow is stuck.
+    if _follow_ref_dist is None:
+        _follow_ref_dist = goal_dist
+        _follow_stuck_count = 0
+    _follow_stuck_count += 1
+    if _follow_stuck_count >= FOLLOW_STUCK_THRESHOLD:
+        progressed = _follow_ref_dist - goal_dist
+        _follow_ref_dist = goal_dist
+        _follow_stuck_count = 0
+        if progressed < FOLLOW_MIN_PROGRESS_PX:
+            return False, True
 
     world_target = np.array(_convert_to_world_coordinates(map_target[0], map_target[1]))
     pose = localization.get_pose()
     v, w = following.dwa_velocity(pose, world_target, devices.timestep / 1000.0)
+    v = _govern_speed(v)          # live-lidar brake so we don't charge unmapped walls
     motion.drive_twist(v, w)
     return False, False
 
@@ -675,7 +704,12 @@ def explore():
 
         # Fallback ONLY when there is no reachable frontier (rare now): a nearby
         # free cell, biased toward the pillar/unknown when a bias is set.
-        if path_to_target is None:
+        # NOTE: plan_frontier returns an EMPTY list [] (not None) for an unreachable
+        # frontier, so test falsiness (None OR []).  Testing `is None` let an
+        # unreachable frontier's [] pass as a valid path -> frontier_following([])
+        # no-ops -> the robot re-selected the same unreachable cluster forever
+        # without ever falling back or rotating.
+        if not path_to_target:
             fallback_cell = select_random_freespace_near_robot()
             if fallback_cell is not None:
                 _current_goal = fallback_cell
@@ -683,7 +717,7 @@ def explore():
                     tuple(_get_map_position()), fallback_cell
                 )
 
-        if path_to_target is not None:
+        if path_to_target:
             frontier_following(path_to_target)
             _no_path_streak = 0
         else:
@@ -742,14 +776,14 @@ def clear_target_bias():
 def reset():
     """Clear exploration state (visited frontiers, follow state, overlays, bias)."""
     global _visited, _current_goal, _current_path, _tick_count, _no_path_streak
-    global _follow_last_position, _follow_stuck_count, _target_bias
+    global _follow_ref_dist, _follow_stuck_count, _target_bias
     global _obstacle_recover_streak
     _visited = []
     _current_goal = None
     _current_path = None
     _tick_count = 0
     _no_path_streak = 0
-    _follow_last_position = None
+    _follow_ref_dist = None
     _follow_stuck_count = 0
     _target_bias = None
     _obstacle_recover_streak = 0
