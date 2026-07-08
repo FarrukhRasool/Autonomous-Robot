@@ -62,14 +62,23 @@ _state = SEEKING_BLUE
 _tick_count = 0
 _current_route = None   # the live A* route being driven (for the map overlay)
 
+# ── TEMPORARY mission diagnostics (Phase 1) ───────────────────────────────────
+# Instrumentation ONLY — no logic/behaviour change.  Traces each _drive_to
+# planning attempt and every _drive_to return reason, so the "blue not reached"
+# failure can be split into planning-failure vs mark-acceptance-failure.  Set
+# _MISSION_DEBUG = False to silence.
+_MISSION_DEBUG = True
+_last_seen_time = {"blue": None, "yellow": None}   # sim time (s) each pillar was last visible
+
 
 def reset():
-    global _seen, _registered, _state, _tick_count, _current_route
+    global _seen, _registered, _state, _tick_count, _current_route, _last_seen_time
     _seen = {"blue": False, "yellow": False}
     _registered = {"blue": False, "yellow": False}
     _state = SEEKING_BLUE
     _tick_count = 0
     _current_route = None
+    _last_seen_time = {"blue": None, "yellow": None}
     perception.reset_target_memory()
 
 
@@ -129,6 +138,8 @@ def _perceive(colors=None):
     for color in ("blue", "yellow"):
         if not colors.get(color):
             continue
+        if _MISSION_DEBUG:
+            _last_seen_time[color] = devices.robot.getTime()   # Phase-1 diagnostic only
         bearing = colors.get(f"{color}_bearing_rad")
         dist = colors.get(f"{color}_distance_m", float("inf"))
         if bearing is None or not math.isfinite(dist):
@@ -227,6 +238,72 @@ def _tick():
     return result
 
 
+# Local-recovery escalation for the final drive.  After a recovery the robot
+# resumes the EXISTING optimal A* route rather than discarding it and replanning,
+# escalating in tiers keyed on the count of consecutive recoveries WITHOUT reaching
+# a waypoint (reset to 0 whenever one is reached):
+#   1 .. RETRY_SAME_ATTEMPTS   -> retry the SAME waypoint (most recoveries move only
+#                                 a few cm, so the original target is usually still valid)
+#   .. MAX_REJOIN_ATTEMPTS     -> rejoin from the nearest remaining waypoint; and only
+#                                 now (map settled) test whether the route is blocked
+#   beyond MAX_REJOIN_ATTEMPTS -> global replan (last resort)
+RETRY_SAME_ATTEMPTS = 2
+MAX_REJOIN_ATTEMPTS = 4
+
+
+def _nearest_remaining_index(path, from_index, robot_cell):
+    """Index of the waypoint AT OR AHEAD OF from_index that is closest to
+    robot_cell ((map_x, map_y)).  Scans only forward from from_index, so a
+    recovery can never rewind the follow cursor onto an already-passed waypoint.
+    Used to rejoin the existing global path after a local recovery instead of
+    discarding it and running a fresh A* search."""
+    start = min(int(from_index), len(path) - 1)
+    best_i = start
+    best_d = float("inf")
+    for i in range(start, len(path)):
+        dx = path[i][0] - robot_cell[0]
+        dy = path[i][1] - robot_cell[1]
+        d = dx * dx + dy * dy
+        if d < best_d:
+            best_d = d
+            best_i = i
+    return best_i
+
+
+def _resume_after_recovery(path, target_index, recover_count):
+    """Decide how to resume the drive after a LOCAL recovery; returns
+    (new_target_index, need_replan).  Preserves the existing global path as long
+    as possible via the tiered escalation described in the module constants:
+      * retry the SAME waypoint first (target unchanged — most recoveries move
+        only a few cm, so the original target is usually still reachable),
+      * then rejoin the nearest remaining waypoint — and only at this point, once
+        the map has settled past the first recoveries, test whether the remaining
+        route is genuinely blocked (deferred path-invalidation),
+      * then, as a last resort, request a global replan."""
+    if recover_count <= RETRY_SAME_ATTEMPTS:
+        return target_index, False                      # retry the same waypoint
+    if recover_count <= MAX_REJOIN_ATTEMPTS:
+        if exploration._path_blocked(path[target_index:]):
+            return target_index, True                   # route genuinely blocked -> replan
+        return _nearest_remaining_index(
+            path, target_index, exploration._get_map_position()), False
+    return target_index, True                           # repeated failure -> global replan
+
+
+def _drive_log_return(color, reason, value):
+    """Phase-1 diagnostic: log the exact _drive_to exit reason, final pose, and how
+    long ago the pillar was last visible, then return `value` UNCHANGED (no
+    behaviour change — every _drive_to return is wrapped in this)."""
+    if _MISSION_DEBUG:
+        x, y, th = localization.get_pose()
+        last = _last_seen_time.get(color)
+        now = devices.robot.getTime()
+        seen = f"{now - last:.1f}s ago" if last is not None else "never"
+        print(f"[DRIVE/exit] {color} reason={reason} -> {value}  "
+              f"pose=({x:+.2f}, {y:+.2f}, {math.degrees(th):+.0f}deg)  last_seen={seen}")
+    return value
+
+
 def _drive_to(color, should_continue):
     """Drive to the remembered `color` pillar: known-free A* to a stand-off cell
     in front of it + DWA following, continuously re-planning toward the (refined)
@@ -239,7 +316,7 @@ def _drive_to(color, should_continue):
     while should_continue():
         world = perception.get_target_memory(color)
         if world is None:
-            return False
+            return _drive_log_return(color, "no_memory", False)
 
         goal_cell = _approach_cell(localization.get_pose(), world)
         # Route THROUGH unknown space (block_unknown=False), like the frontier
@@ -251,32 +328,44 @@ def _drive_to(color, should_continue):
         # the governor / bumper / recovery as the robot advances.
         route = planning.plan(tuple(exploration._get_map_position()), goal_cell,
                               block_unknown=False)
+        if _MISSION_DEBUG:
+            _rx, _ry, _rth = localization.get_pose()
+            _dist = math.hypot(world[0] - _rx, world[1] - _ry)
+            _herr = ((math.atan2(world[1] - _ry, world[0] - _rx) - _rth + math.pi)
+                     % (2.0 * math.pi) - math.pi)
+            _rlen = len(route) if route else 0
+            print(f"[DRIVE/plan] {color} pose=({_rx:+.2f}, {_ry:+.2f}, "
+                  f"{math.degrees(_rth):+.0f}deg) mem=({world[0]:+.2f}, {world[1]:+.2f}) "
+                  f"goal_cell={goal_cell} dist={_dist:.2f}m "
+                  f"head_err={math.degrees(_herr):+.0f}deg route_len={_rlen} "
+                  f"valid={bool(route) and _rlen >= 2}")
         if not route or len(route) < 2:
             # Can't plan a path -- if we're already confirmed at the pillar, win.
             colors = sensors.read_color_detections()
             _perceive(colors)
             if _within_mark_dist(color, colors):
                 exploration._stop_motor()
-                return True
-            return False
+                return _drive_log_return(color, "already_marked", True)
+            return _drive_log_return(color, "planning_failed", False)
 
         current_path = list(route)
         _current_route = current_path        # expose the full route for the live map
         target_index = FOLLOW_WAYPOINT_STRIDE
         need_replan = False
+        recover_count = 0        # consecutive recoveries since the last waypoint reached
 
         while target_index < len(current_path) and not need_replan:
             target = current_path[target_index]
             while _tick() != -1:
                 if not should_continue():
                     exploration._stop_motor()
-                    return False
+                    return _drive_log_return(color, "stopped", False)
 
                 colors = sensors.read_color_detections()
                 _perceive(colors)                        # localize + register both pillars
                 if _within_mark_dist(color, colors):     # confirmed within mark distance
                     exploration._stop_motor()
-                    return True
+                    return _drive_log_return(color, "mark_confirmed", True)
 
                 # ── Reactive visual approach (autonomous.py seek) ──────────────
                 # When the pillar is IN SIGHT, drive straight at it (centre the
@@ -295,25 +384,32 @@ def _drive_to(color, should_continue):
 
                 if exploration._obstacle_in_front():
                     exploration._recover_from_obstacle()
-                    need_replan = True
+                    recover_count += 1
+                    target_index, need_replan = _resume_after_recovery(
+                        current_path, target_index, recover_count)
                     break
 
                 reached, is_stuck = exploration._follow_local_target(target)
                 if is_stuck:
                     exploration._recover_from_stuck()
-                    need_replan = True
+                    recover_count += 1
+                    target_index, need_replan = _resume_after_recovery(
+                        current_path, target_index, recover_count)
                     break
                 if reached:
+                    recover_count = 0                       # progress -> reset rejoin budget
+                    target_index += FOLLOW_WAYPOINT_STRIDE   # advance ONLY on a real reach
                     break
-            target_index += FOLLOW_WAYPOINT_STRIDE
+            else:
+                break        # inner loop ended via _tick()==-1 (sim end) -> stop following
 
         replans += 1
         if replans > 12:            # give up after persistent failure to make progress
             exploration._stop_motor()
-            return False
+            return _drive_log_return(color, "mark_not_confirmed", False)
 
     exploration._stop_motor()
-    return False
+    return _drive_log_return(color, "stopped", False)
 
 
 def _seek_and_reach(color, should_continue):
