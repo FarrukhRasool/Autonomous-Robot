@@ -62,13 +62,29 @@ _target_bias = None
 
 # follow_local_target stuck-detection state (reference __init__ values)
 _follow_ref_dist = None             # goal distance (map cells) at the progress-window start
+_follow_ref_pos = None              # robot world (x, y) at the progress-window start (metres)
 _follow_stuck_count = 0             # ticks elapsed in the current progress window
 FOLLOW_MIN_PROGRESS_PX = 3          # cells the goal distance must shrink per window, else stuck
 FOLLOW_STUCK_THRESHOLD = 25         # window length (ticks) over which progress is measured
+# Option C physical-motion gate: net world displacement (metres) over the window
+# below which the robot counts as physically not moving.  A genuine wedge shows
+# ~0 net displacement; a governor-throttled crawl still covers well more than
+# this (even 0.05 m/s over the window travels >2 cm), so the crawl is exempted.
+# Kept small so ONLY a true lack of motion — not intentional slow motion — can,
+# together with low goal progress, declare "stuck".
+FOLLOW_STUCK_MIN_MOVE_M = 0.02
 
 # Consecutive obstacle recoveries without escaping — escalates to a turn (see
 # _recover_from_obstacle).  Reset when a new frontier follow starts / on reset.
 _obstacle_recover_streak = 0
+
+# ── TEMPORARY navigation diagnostics ──────────────────────────────────────────
+# Instrumentation ONLY — changes no behaviour.  Traces the governor / virtual-
+# bumper / stuck-watchdog decisions so the stuck corridor loop can be attributed
+# to an exact trigger.  Set _NAV_DEBUG = False to silence, or delete this block
+# and the [NAV...] print sites once the cause is confirmed.
+_NAV_DEBUG = True
+_nav_dbg_tick = 0   # throttles the per-tick follow/governor snapshot line
 
 
 # ── self.step() override + odometry/mapping (reference step() + lidar thread) ─
@@ -217,9 +233,39 @@ def _govern_speed(v):
     if not math.isfinite(front) or front >= FOLLOW_GOVERNOR_FULL_M:
         return v
     if front <= FOLLOW_GOVERNOR_MIN_M:
+        # DIAGNOSTIC: the governor is zeroing forward speed.  Behaviour unchanged.
+        if _NAV_DEBUG:
+            print(f"[NAV/gov] STOP  front={front:.3f}m <= MIN {FOLLOW_GOVERNOR_MIN_M}m "
+                  f"(arc ±{FOLLOW_GOVERNOR_ARC_DEG}°) -> v {v:.3f}->0.000")
         return 0.0
     scale = (front - FOLLOW_GOVERNOR_MIN_M) / (FOLLOW_GOVERNOR_FULL_M - FOLLOW_GOVERNOR_MIN_M)
     return v * scale
+
+
+def _nav_debug_snapshot(v_raw, v_governed, w):
+    """TEMPORARY diagnostic (no behaviour change): emit one throttled line with
+    everything needed to attribute the stuck corridor loop —
+      * front-lidar min distance at the governor arc and the bumper arc (±35°),
+      * the four range-sensor values (fl, rl, fr, rr),
+      * the raw DWA linear velocity vs the governed one, and whether it was limited,
+      * the commanded angular velocity, and
+      * whether _obstacle_in_front() would assert, and via which sensor.
+    Throttled to every 3rd call so the console stays readable."""
+    global _nav_dbg_tick
+    _nav_dbg_tick += 1
+    if _nav_dbg_tick % 3 != 0:
+        return
+    front_gov = _get_lidar_front_min_dist(angle_range_deg=FOLLOW_GOVERNOR_ARC_DEG)
+    front_bump = _get_lidar_front_min_dist(angle_range_deg=35)
+    ds = _get_distances()                       # [fl, rl, fr, rr]
+    gov_limited = v_governed < v_raw - 1e-4
+    ds_trig = min(ds[0], ds[2]) < 0.05          # same test as _obstacle_in_front
+    lidar_trig = front_bump < 0.10              # same test as _obstacle_in_front
+    who = (" [DS]" if ds_trig else "") + (" [LIDAR]" if lidar_trig else "")
+    print(f"[NAV] v_raw={v_raw:.3f} v_gov={v_governed:.3f} w={w:+.2f} "
+          f"gov_limited={gov_limited} front{int(FOLLOW_GOVERNOR_ARC_DEG)}={front_gov:.3f} "
+          f"front35={front_bump:.3f} ds[fl={ds[0]:.3f} rl={ds[1]:.3f} fr={ds[2]:.3f} rr={ds[3]:.3f}] "
+          f"bumper={'TRUE' if (ds_trig or lidar_trig) else 'false'}{who}")
 
 
 def _obstacle_in_front():
@@ -530,36 +576,67 @@ def _follow_local_target(map_target):
     """Reference follow_local_target -> (reached, is_stuck).  Drives DWA toward
     map_target; flags stuck when it stops making PROGRESS toward the target.
 
-    Progress (goal distance shrinking), not per-tick movement, is the stuck test:
-    at a wall the governor zeroes forward speed while DWA keeps a turn, so the robot
-    wiggles/rotates in place — that per-tick motion kept resetting the old
-    'hasn't-moved' counter, so stuck never fired and the robot sat there forever.
-    Measuring goal-distance progress over a window catches that oscillation."""
-    global _follow_ref_dist, _follow_stuck_count
+    Stuck test (Option C — goal progress AND physical motion):
+    over a FOLLOW_STUCK_THRESHOLD-tick window the follow is declared stuck ONLY if
+    BOTH signals are low —
+      * goal-distance closed  < FOLLOW_MIN_PROGRESS_PX cells, AND
+      * net world displacement < FOLLOW_STUCK_MIN_MOVE_M metres.
+    Goal-progress alone (the old test) misread the safety governor: near obstacles
+    the governor legitimately throttles forward speed, so the robot crawls slowly
+    and closes only a cell or two of goal distance per window — real, safe motion
+    that the old test flagged as stuck, triggering a needless reverse/replan loop.
+    Adding the physical-motion AND-clause exempts that crawl.  It cannot miss a
+    genuine wedge: goal-distance closed can never exceed net displacement (triangle
+    inequality), so a truly stuck robot (≈0 displacement) still trips both clauses.
+    Net displacement is measured over the whole WINDOW (start pose vs end pose), not
+    per tick, so an in-place wiggle/rotate — which nets ≈0 translation — is still
+    correctly caught as stuck (the reason the original used goal progress, now kept
+    as the second clause)."""
+    global _follow_ref_dist, _follow_ref_pos, _follow_stuck_count
 
     goal_dist = _get_map_distance(map_target)          # map cells
     if goal_dist < PATH_FOLLOWING_TARGET_REACH_DIST_PX:
         _follow_ref_dist = None
+        _follow_ref_pos = None
         _follow_stuck_count = 0
         return True, False
 
-    # Progress watchdog: over FOLLOW_STUCK_THRESHOLD ticks the goal distance must
-    # shrink by at least FOLLOW_MIN_PROGRESS_PX cells, else the follow is stuck.
+    # Progress watchdog: snapshot both the goal distance and the physical position
+    # at the window start, then compare after FOLLOW_STUCK_THRESHOLD ticks.
     if _follow_ref_dist is None:
         _follow_ref_dist = goal_dist
+        _follow_ref_pos = _get_position()      # world (x, y) metres at window start
         _follow_stuck_count = 0
     _follow_stuck_count += 1
     if _follow_stuck_count >= FOLLOW_STUCK_THRESHOLD:
-        progressed = _follow_ref_dist - goal_dist
+        progressed = _follow_ref_dist - goal_dist                       # goal cells closed
+        moved_m = float(np.linalg.norm(_get_position() - _follow_ref_pos))  # physical metres
         _follow_ref_dist = goal_dist
+        _follow_ref_pos = _get_position()
         _follow_stuck_count = 0
-        if progressed < FOLLOW_MIN_PROGRESS_PX:
+        low_goal_progress = progressed < FOLLOW_MIN_PROGRESS_PX
+        barely_moved = moved_m < FOLLOW_STUCK_MIN_MOVE_M
+        if low_goal_progress and barely_moved:
+            # TRUE stuck: failed to close the goal AND physically didn't move.
+            if _NAV_DEBUG:
+                print(f"[NAV/stuck] TRUE stuck: closed {progressed:.1f}px "
+                      f"< {FOLLOW_MIN_PROGRESS_PX}px AND moved {moved_m:.3f}m "
+                      f"< {FOLLOW_STUCK_MIN_MOVE_M}m over {FOLLOW_STUCK_THRESHOLD} ticks "
+                      f"-> is_stuck (reverse+replan)")
             return False, True
+        if _NAV_DEBUG and low_goal_progress:
+            # Slow but real motion — the governor is throttling near an obstacle;
+            # NOT stuck.  (This line disappears once the fix is confirmed.)
+            print(f"[NAV/stuck] slow-but-moving (NOT stuck): closed {progressed:.1f}px "
+                  f"< {FOLLOW_MIN_PROGRESS_PX}px but moved {moved_m:.3f}m "
+                  f">= {FOLLOW_STUCK_MIN_MOVE_M}m")
 
     world_target = np.array(_convert_to_world_coordinates(map_target[0], map_target[1]))
     pose = localization.get_pose()
-    v, w = following.dwa_velocity(pose, world_target, devices.timestep / 1000.0)
-    v = _govern_speed(v)          # live-lidar brake so we don't charge unmapped walls
+    v_raw, w = following.dwa_velocity(pose, world_target, devices.timestep / 1000.0)
+    v = _govern_speed(v_raw)      # live-lidar brake so we don't charge unmapped walls
+    if _NAV_DEBUG:
+        _nav_debug_snapshot(v_raw, v, w)   # instrumentation only; behaviour unchanged
     motion.drive_twist(v, w)
     return False, False
 
@@ -787,7 +864,7 @@ def clear_target_bias():
 def reset():
     """Clear exploration state (visited frontiers, follow state, overlays, bias)."""
     global _visited, _current_goal, _current_path, _tick_count, _no_path_streak
-    global _follow_ref_dist, _follow_stuck_count, _target_bias
+    global _follow_ref_dist, _follow_ref_pos, _follow_stuck_count, _target_bias
     global _obstacle_recover_streak
     _visited = []
     _current_goal = None
@@ -795,6 +872,7 @@ def reset():
     _tick_count = 0
     _no_path_streak = 0
     _follow_ref_dist = None
+    _follow_ref_pos = None
     _follow_stuck_count = 0
     _target_bias = None
     _obstacle_recover_streak = 0
