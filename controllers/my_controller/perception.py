@@ -10,6 +10,14 @@ Frame convention (matches localization.py and mapping.py):
 
 import math
 
+import sensors
+import localization
+import mapping
+from config import (
+    MISSION_MARK_RATIO, MISSION_MARK_LASER_M, MISSION_MARK_BEARING_RAD,
+    MISSION_MARK_MAX_STAMP_M,
+)
+
 
 def target_world_position(pose, bearing_rad, distance_m):
     """Project a target observation into the world frame.
@@ -97,6 +105,13 @@ def bearing_distance_from_pose(pose, world_position):
 # Latest world-frame sighting per target color, or None when unseen / cleared.
 _target_memory = {"blue": None, "yellow": None}
 
+# True once a color has been CONFIRMED at least once (pillar_confirmed) — after
+# that, tag_pillars_on_map freezes _target_memory at the reliable stamped
+# position instead of continuing to overwrite it with noisy live depth
+# sightings, since re-planning/backtracking to a pillar relies on the memory
+# matching the position actually stamped on the map.
+_target_confirmed = {"blue": False, "yellow": False}
+
 
 def update_target_memory(color, pose, bearing_rad, distance_m):
     """Project the current observation and store it as the latest sighting.
@@ -118,12 +133,91 @@ def get_target_memory(color):
 
 
 def forget_target(color):
-    """Drop the stored sighting for one color (e.g. a stale/wrong memory)."""
+    """Drop the stored sighting for one color (e.g. a stale/wrong memory).
+
+    Also clears the confirmed flag, so tag_pillars_on_map resumes updating
+    the memory from live sightings again (otherwise a forgotten pillar could
+    never be re-acquired, since a confirmed color's memory is normally frozen).
+    """
     if color in _target_memory:
         _target_memory[color] = None
+    if color in _target_confirmed:
+        _target_confirmed[color] = False
 
 
 def reset_target_memory():
     """Clear all stored sightings (called by the R keypress)."""
     for key in _target_memory:
         _target_memory[key] = None
+    for key in _target_confirmed:
+        _target_confirmed[key] = False
+
+
+# ── Pillar recognition + map colour-tagging (FR4) ────────────────────────────
+# Mode-independent: safe to call from teleop, G/Y/E, or mission.run() alike, so
+# blue/yellow always show up as their own colour on the map (mapping.CELL_BLUE/
+# CELL_YELLOW) instead of a generic obstacle, regardless of which mode mapped
+# them.  mission.py layers its own SEEKING_BLUE/YELLOW sequencing state on top
+# of pillar_confirmed(); it does not duplicate this confirm logic.
+
+def pillar_confirmed(color, colors):
+    """True only if `color` is CONFIRMED genuinely at the pillar — via signals
+    that don't depend on the unreliable depth-Pythagoras distance:
+      1. the mask fills MISSION_MARK_RATIO of the frame (pillar dominates view), OR
+      2. the front laser is at contact range (< MISSION_MARK_LASER_M) while the
+         pillar is centred (|bearing| < MISSION_MARK_BEARING_RAD) — a wall can't
+         trigger it because the pillar must be visible AND pointing forward.
+    (The depth distance is deliberately NOT used here: it under-estimates far
+    pillars badly, which caused false "reached" marks from across the map.)
+    """
+    if not colors.get(color):
+        return False
+    ratio = colors.get(f"{color}_ratio", 0.0)
+    bearing = colors.get(f"{color}_bearing_rad")
+    if ratio >= MISSION_MARK_RATIO:
+        return True
+    if (bearing is not None and abs(bearing) < MISSION_MARK_BEARING_RAD
+            and sensors.get_front_laser_min() < MISSION_MARK_LASER_M):
+        return True
+    return False
+
+
+def tag_pillars_on_map(colors=None):
+    """Recognize blue/yellow pillars and stamp the confirmed one's cell on the
+    occupancy grid in its true colour (mapping.mark_pillar).
+
+    Updates the world-frame sighting memory for any visible pillar (used to
+    navigate toward it) with the live, noisy depth sighting only UNTIL that
+    pillar is confirmed for the first time; once confirmed, the memory is
+    frozen at the accurate stamped (laser) position below instead, so a
+    still-noisy live glimpse can't drag an already-registered pillar's
+    remembered position off the spot actually marked on the map (which
+    backtracking / re-planning rely on).  The map itself is stamped only once
+    CONFIRMED (pillar_confirmed) — a distant glimpse is never coloured on the
+    map.
+    """
+    if colors is None:
+        colors = sensors.read_color_detections()
+    pose = localization.get_pose()
+    for color in ("blue", "yellow"):
+        if not colors.get(color):
+            continue
+        bearing = colors.get(f"{color}_bearing_rad")
+        dist = colors.get(f"{color}_distance_m", float("inf"))
+        if bearing is None or not math.isfinite(dist):
+            continue
+        if not _target_confirmed[color]:
+            update_target_memory(color, pose, bearing, dist)
+        if pillar_confirmed(color, colors):
+            # Stamp at the reliable close range (front laser, clamped),
+            # directly ahead — the pillar is centred at this moment — NOT the
+            # bad depth distance.
+            fd = sensors.get_front_laser_min()
+            stamp_d = fd if math.isfinite(fd) and fd <= MISSION_MARK_MAX_STAMP_M else MISSION_MARK_MAX_STAMP_M
+            world = target_world_position(pose, bearing, stamp_d)
+            if world is not None:
+                mapping.mark_pillar(mapping.world_to_map(world[0], world[1]), color)
+                # Freeze memory at this reliable stamped position so it matches
+                # the map stamp (and the drawn circle) from now on.
+                update_target_memory(color, pose, bearing, stamp_d)
+            _target_confirmed[color] = True
