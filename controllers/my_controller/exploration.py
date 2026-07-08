@@ -68,11 +68,12 @@ FOLLOW_MIN_PROGRESS_PX = 3          # cells the goal distance must shrink per wi
 FOLLOW_STUCK_THRESHOLD = 25         # window length (ticks) over which progress is measured
 # Option C physical-motion gate: net world displacement (metres) over the window
 # below which the robot counts as physically not moving.  A genuine wedge shows
-# ~0 net displacement; a governor-throttled crawl still covers well more than
-# this (even 0.05 m/s over the window travels >2 cm), so the crawl is exempted.
-# Kept small so ONLY a true lack of motion — not intentional slow motion — can,
-# together with low goal progress, declare "stuck".
-FOLLOW_STUCK_MIN_MOVE_M = 0.02
+# ~0 net displacement; a governor-throttled crawl still covers more than this, so
+# the crawl is exempted.  Lowered 0.02 -> 0.01 after a run showed a legitimate slow
+# crawl of 0.015 m/window being mislabeled stuck at the old threshold.  Deliberately
+# translation-only (no rotation gate): a robot pivoting in place AGAINST an obstacle
+# is a genuine stall we still want caught.
+FOLLOW_STUCK_MIN_MOVE_M = 0.01
 
 # Consecutive obstacle recoveries without escaping — escalates to a turn (see
 # _recover_from_obstacle).  Reset when a new frontier follow starts / on reset.
@@ -285,11 +286,79 @@ def _obstacle_in_front():
 
 # ── Recovery (reference recover_from_stuck / recover_from_obstacle) ────────────
 
+# Both rear range sensors (rl, rr) below this = the rear is against an obstacle,
+# so a reverse recovery would only drive the robot harder into the wall behind it
+# (the observed rl≈rr≈0.026 m rear-pinned wedge).  In that case recovery pivots in
+# place toward the side with more clearance instead of reversing.
+RECOVER_REAR_BLOCKED_M = 0.08
+
+
+def _side_clearances():
+    """Nearest lidar range (m) in the left (+30°..+90°) and right (-90°..-30°)
+    body-frame arcs; larger = more open on that side.  An arc with no returns
+    (fully open) yields +inf.  Used only by recovery to choose the pivot direction
+    with more escape space when the rear is blocked.  (+y is left in the body
+    frame, so a positive bearing is the left side.)"""
+    pts = np.asarray(sensors.read_lidar_pointcloud_2d())
+    if len(pts) == 0:
+        return float("inf"), float("inf")
+    angles = np.arctan2(pts[:, 1], pts[:, 0])
+    dists = np.linalg.norm(pts, axis=1)
+    lo, hi = math.radians(30), math.radians(90)
+    left = dists[(angles > lo) & (angles < hi)]
+    right = dists[(angles < -lo) & (angles > -hi)]
+    left_m = float(np.min(left)) if left.size else float("inf")
+    right_m = float(np.min(right)) if right.size else float("inf")
+    return left_m, right_m
+
+
+def _rear_blocked(distances):
+    """True when BOTH rear sensors (rl=index 1, rr=index 3) read below the
+    rear-blocked threshold — the robot's back is against a wall, so a reverse
+    would drive into it."""
+    return distances[1] < RECOVER_REAR_BLOCKED_M and distances[3] < RECOVER_REAR_BLOCKED_M
+
+
+def _pivot_to_open_side(turn_duration, tag):
+    """In-place pivot toward whichever side has more lidar clearance, for a random
+    duration in turn_duration (ms).  The rear-blocked escape shared by both
+    recoveries: reface open space instead of reversing into the wall behind."""
+    left_clear, right_clear = _side_clearances()
+    duration = random.randint(turn_duration[0], turn_duration[1])
+    if left_clear >= right_clear:
+        print(f"[{tag}] rear blocked -> pivot LEFT toward clearance "
+              f"(L={left_clear:.2f} R={right_clear:.2f})")
+        _turn_left_milisecond(duration)
+    else:
+        print(f"[{tag}] rear blocked -> pivot RIGHT toward clearance "
+              f"(L={left_clear:.2f} R={right_clear:.2f})")
+        _turn_right_milisecond(duration)
+    _stop_motor()
+
+
 def _recover_from_stuck(turn_duration=(800, 1200)):
     """Reference recover_from_stuck: reverse (length gated on rear clearance),
-    settle, then turn a random direction/duration."""
+    settle, then turn a random direction/duration.
+
+    Rear-blocked guard (NEW): read the rear sensors FIRST; if both show the rear is
+    against an obstacle (_rear_blocked), skip the reverse entirely — reversing would
+    only push the robot into the wall behind it (the rl≈rr≈0.026 m rear-pinned
+    wedge) — and instead pivot in place toward the side with more lidar clearance,
+    then return so the caller replans.  When the rear is clear the original
+    reverse-then-turn recovery runs unchanged."""
+    distances = _get_distances()          # [fl, rl, fr, rr]
+
+    if _rear_blocked(distances):
+        print(f"[recover from stuck] rear against wall (rl={distances[1]:.3f} "
+              f"rr={distances[3]:.3f}) — not reversing")
+        _pivot_to_open_side(turn_duration, "recover from stuck")
+        for _ in range(40):
+            if _tick(devices.timestep) == -1:
+                _stop_motor()
+                return False
+        return
+
     _set_robot_velocity(-5, -5)
-    distances = _get_distances()
     if distances[1] > 0.25 and distances[3] > 0.25:
         print("reversing longer")
         _tick(500)
@@ -334,8 +403,23 @@ def _recover_from_obstacle(turn_duration=(800, 1200)):
         change the re-approach heading.
     """
     global _obstacle_recover_streak
-    _set_robot_velocity(-5, -5)
     distances = _get_distances()   # [fl, rl, fr, rr]
+
+    # Rear-blocked guard (NEW, same as _recover_from_stuck): if the rear is against
+    # a wall, reversing off the front obstacle would only drive the robot into the
+    # wall behind it.  Pivot toward the side with more clearance to change heading,
+    # then return so the caller replans.
+    if _rear_blocked(distances):
+        print(f"[recover from obstacle] rear against wall (rl={distances[1]:.3f} "
+              f"rr={distances[3]:.3f}) — not reversing")
+        _pivot_to_open_side(turn_duration, "recover from obstacle")
+        for _ in range(80):
+            if _tick(devices.timestep) == -1:
+                _stop_motor()
+                return False
+        return
+
+    _set_robot_velocity(-5, -5)
     if distances[1] > 0.25 and distances[3] > 0.25:   # rear-left AND rear-right clear
         print("reversing longer [recover from obstacle]")
         _tick(500)
