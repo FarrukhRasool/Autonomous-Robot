@@ -42,7 +42,7 @@ from config import (
     PATH_FOLLOWING_TARGET_REACH_DIST_PX,
     EXPLORE_FREESPACE_RADIUS_PX, EXPLORE_FREESPACE_TRIES,
     EXPLORE_SCAN_TURN_TICKS, EXPLORE_SCAN_TURN_WHEEL, EXPLORE_FORGET_VISITED_EVERY,
-    SLAM_GREEN_PERIOD_STEPS, GREEN_MARK_ENABLED,
+    SLAM_GREEN_PERIOD_STEPS, GREEN_MARK_ENABLED, OVERHEAD_MARK_ENABLED,
     PILLAR_BIAS_WEIGHT, OBSTACLE_RECOVER_TURN_AFTER,
     FOLLOW_GOVERNOR_FULL_M, FOLLOW_GOVERNOR_MIN_M, FOLLOW_GOVERNOR_ARC_DEG,
 )
@@ -102,6 +102,17 @@ def _tick(ms=None):
         green_pts = sensors.green_ground_points_body()
         if len(green_pts) > 0:
             mapping.mark_green(localization.get_pose(), green_pts)
+
+    # Overhead/floating-wall marking (depth-camera based) ~10 Hz, only when not
+    # turning.  A floating wall sits above the lidar's scan plane, so the depth
+    # ROI is the only evidence of it; project it to the floor and stamp it as a
+    # hard obstacle (CELL_CLOSED) so the planner/DWA route around it.
+    if (OVERHEAD_MARK_ENABLED
+            and _tick_count % SLAM_GREEN_PERIOD_STEPS == 0
+            and not motion.is_turning()):
+        overhead_pts = sensors.overhead_obstacle_points_body()
+        if len(overhead_pts) > 0:
+            mapping.mark_overhead(localization.get_pose(), overhead_pts)
 
     if _should_continue is not None and not _should_continue():
         return -1

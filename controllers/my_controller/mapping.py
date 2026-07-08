@@ -261,6 +261,38 @@ def mark_green(pose, points_local):
         _grid = new_grid
 
 
+def mark_overhead(pose, points_local):
+    """Stamp projected floating/overhead-obstacle points as CELL_CLOSED.
+
+    pose is (x, y, theta); points_local is Nx2 body-frame [x_forward, y_left]
+    (from sensors.overhead_obstacle_points_body).  CELL_CLOSED is already
+    protected from sensor-driven erasure by _grid_from_log_odds and already
+    treated as a hard obstacle by there_is_obstacle / planning / following, so
+    a floating wall the lidar's scan plane passes under stays mapped even as
+    later lidar rays sweep the (lidar-height) free space beneath it.
+
+    A cell already confirmed as a pillar (CELL_BLUE / CELL_YELLOW — pillars are
+    tall enough to also trigger the overhead depth band) is left alone: the
+    dedicated pillar colour must win over a generic obstacle mark so FR4's
+    blue/yellow targets stay visible on the map instead of blending into the
+    walls.
+    """
+    if pose is None or points_local is None:
+        return
+    pts = np.asarray(points_local, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] != 2:
+        return
+    map_points = _world_points_to_map(_transform_to_world(pts, pose))
+    global _grid
+    with LOCK:
+        new_grid = _grid.copy()
+        for mx, my in map_points:
+            if (0 <= mx < MAP_SIZE and 0 <= my < MAP_SIZE
+                    and new_grid[my, mx] not in (CELL_BLUE, CELL_YELLOW)):
+                new_grid[my, mx] = CELL_CLOSED
+        _grid = new_grid
+
+
 def mark_pillar(cell, color, radius_cells=1):
     """Stamp a small disk around `cell` with the pillar colour code (CELL_BLUE /
     CELL_YELLOW).  Called by the mission once a pillar is confirmed within the

@@ -41,7 +41,7 @@ import exploration
 from config import (
     APPROACH_OFFSET_M, MISSION_MARK_RATIO,
     MISSION_MARK_LASER_M, MISSION_MARK_BEARING_RAD, MISSION_MARK_MAX_STAMP_M,
-    GREEN_MARK_ENABLED, SLAM_GREEN_PERIOD_STEPS,
+    GREEN_MARK_ENABLED, OVERHEAD_MARK_ENABLED, SLAM_GREEN_PERIOD_STEPS,
     FOLLOW_WAYPOINT_STRIDE,
     SEEK_LIN_VEL, SEEK_OMEGA, SEEK_BEARING_DEADBAND_RAD,
     PILLAR_COMMIT_DIST_M,
@@ -215,6 +215,15 @@ def _tick():
         green_pts = sensors.green_ground_points_body()
         if len(green_pts) > 0:
             mapping.mark_green(localization.get_pose(), green_pts)
+    # Overhead/floating-wall marking (depth-camera based): stamp floating walls
+    # above the lidar's scan plane as hard obstacles (CELL_CLOSED) so the final
+    # drive's planner/DWA route around them.
+    if (OVERHEAD_MARK_ENABLED
+            and _tick_count % SLAM_GREEN_PERIOD_STEPS == 0
+            and not motion.is_turning()):
+        overhead_pts = sensors.overhead_obstacle_points_body()
+        if len(overhead_pts) > 0:
+            mapping.mark_overhead(localization.get_pose(), overhead_pts)
     return result
 
 
