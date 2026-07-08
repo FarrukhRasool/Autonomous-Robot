@@ -133,8 +133,12 @@ def _perceive(colors=None):
         dist = colors.get(f"{color}_distance_m", float("inf"))
         if bearing is None or not math.isfinite(dist):
             continue
-        # Localize (for navigation direction) on every sighting, any distance.
-        perception.update_target_memory(color, pose, bearing, dist)
+        # Localize (for navigation direction) with the camera-depth sighting only
+        # UNTIL the pillar is registered.  Once it's marked, the memory is frozen at
+        # the accurate stamped (laser) position below, so stop letting noisy depth
+        # sightings drift it — that frozen position is what backtracking uses.
+        if not _registered[color]:
+            perception.update_target_memory(color, pose, bearing, dist)
         if not _seen[color]:
             print(f"[MISSION] {color} column spotted (dist~{dist:.2f} m) — approaching to confirm")
             _seen[color] = True
@@ -147,6 +151,10 @@ def _perceive(colors=None):
             world = perception.target_world_position(pose, bearing, stamp_d)
             if world is not None:
                 mapping.mark_pillar(mapping.world_to_map(world[0], world[1]), color)
+                # Remember THIS stamped position for backtracking — freeze the memory
+                # at the laser-based mark so it matches the map stamp (and the drawn
+                # circle) instead of the drifting depth sighting.
+                perception.update_target_memory(color, pose, bearing, stamp_d)
             _registered[color] = True
             print(f"[MISSION] {color} pillar reached & marked on map "
                   f"(laser={fd:.2f} m, ratio={colors.get(f'{color}_ratio', 0):.3f})")
@@ -225,7 +233,15 @@ def _drive_to(color, should_continue):
             return False
 
         goal_cell = _approach_cell(localization.get_pose(), world)
-        route = planning.plan(tuple(exploration._get_map_position()), goal_cell)
+        # Route THROUGH unknown space (block_unknown=False), like the frontier
+        # planner.  The traceback to a KNOWN/marked pillar (blue->yellow) crosses
+        # cells the robot never mapped on its winding way out; the default goal-run
+        # mode makes every unknown cell a wall, so A* finds no route and the drive
+        # gives up instantly (the "retrying drive" spam that ends in "stopped before
+        # reaching yellow").  Real obstacles in the unmapped stretch are handled by
+        # the governor / bumper / recovery as the robot advances.
+        route = planning.plan(tuple(exploration._get_map_position()), goal_cell,
+                              block_unknown=False)
         if not route or len(route) < 2:
             # Can't plan a path -- if we're already confirmed at the pillar, win.
             colors = sensors.read_color_detections()
@@ -330,10 +346,16 @@ def _seek_and_reach(color, should_continue):
         if _drive_to(color, should_continue):
             return True
 
-        # Arrived at the remembered spot but not actually at the pillar -> the
-        # sighting was stale/imprecise; forget it and look again.
-        print(f"[MISSION] {color} not reached at remembered spot -> re-acquiring")
-        perception.forget_target(color)
+        # Don't discard a pillar we've already MARKED (reached + colour-stamped on
+        # the map): its position is known-good, so forgetting it and re-exploring is
+        # the robot wandering with the pillar already on the map.  Keep the position
+        # and retry the drive.  Only a never-confirmed (far-glimpsed, unregistered)
+        # pillar is forgotten as a stale sighting and re-acquired by exploration.
+        if _registered[color]:
+            print(f"[MISSION] {color} not reached -> retrying drive (keeping marked position)")
+        else:
+            print(f"[MISSION] {color} not reached at remembered spot -> re-acquiring")
+            perception.forget_target(color)
         attempts += 1
         if attempts > 6:
             return False

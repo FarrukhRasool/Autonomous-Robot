@@ -19,16 +19,17 @@ _WINDOW = "RosBot Map (live)"
 _failed = False   # set True if the OpenCV build cannot open a window (headless)
 
 
-def render(grid, robot_cell=None, goals=None, path=None, scale=2,
-           blue_cell=None, yellow_cell=None):
+def render(grid, robot_cell=None, goals=None, path=None, scale=2):
     """Draw the grid + overlays into the live window.  Returns True if shown.
 
     grid : uint8 occupancy grid [row=y, col=x].
     robot_cell : (x, y) robot map cell (or None).
     goals : list of (x, y) target map cells (or None) — drawn green.
     path : list of (x, y) map cells (or None) — the current planned route.
-    blue_cell / yellow_cell : remembered pillar cells, drawn in their colours.
     scale : integer upscale factor for visibility.
+
+    Pillars are drawn as one big circle at their STAMPED grid cell (the robot's
+    real map memory) — no separate depth-sighting overlay.
     """
     global _failed
     if _failed:
@@ -57,11 +58,13 @@ def render(grid, robot_cell=None, goals=None, path=None, scale=2,
     if goals:
         for gcell in goals:
             cv2.circle(img, _s(gcell), 4, (0, 255, 0), -1)  # green target(s)
-    # Pillars drawn in their own colours (BGR).
-    if blue_cell is not None:
-        cv2.circle(img, _s(blue_cell), 6, (255, 0, 0), -1)     # blue pillar
-    if yellow_cell is not None:
-        cv2.circle(img, _s(yellow_cell), 6, (0, 255, 255), -1)  # yellow pillar
+    # Pillars: one big circle at the STAMPED grid cell (centroid of the pillar's
+    # CELL_BLUE / CELL_YELLOW stamp) in its colour — the robot's real map memory,
+    # not a depth-sighting overlay.
+    for _code, _colour in ((CELL_BLUE, (255, 0, 0)), (CELL_YELLOW, (0, 255, 255))):
+        _ys, _xs = np.where(grid == _code)
+        if len(_xs) > 0:
+            cv2.circle(img, _s((int(_xs.mean()), int(_ys.mean()))), 7, _colour, -1)
     if robot_cell is not None:
         cv2.circle(img, _s(robot_cell), 4, (0, 0, 255), -1)  # robot (red, on top)
 
