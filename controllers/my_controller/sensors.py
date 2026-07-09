@@ -1,9 +1,3 @@
-"""Sensor-reading helpers for the Husarion RosBot.
-
-All functions read from the hardware handles in devices.py.
-Pure data functions — no control logic.
-"""
-
 import math
 
 import numpy as np
@@ -68,13 +62,11 @@ def _read_depth_image():
 
 
 def _rgb_at(img, w, row, col):
-    # Webots RGB camera image is BGRA byte order.
     idx = 4 * (row * w + col)
     b, g, r = img[idx], img[idx + 1], img[idx + 2]
     return r, g, b
 
 
-# HSV colour bands (OpenCV hue 0-179), built once from config.
 _HSV_BANDS = {
     "blue":   (np.array(BLUE_HSV_LOWER,   np.uint8), np.array(BLUE_HSV_UPPER,   np.uint8)),
     "yellow": (np.array(YELLOW_HSV_LOWER, np.uint8), np.array(YELLOW_HSV_UPPER, np.uint8)),
@@ -83,27 +75,24 @@ _HSV_BANDS = {
 
 
 def _get_hsv_image():
-    """RGB camera frame as an HSV numpy image (h, w, 3), or None if unavailable."""
     img, w, h = _read_camera_image(devices.camera_rgb)
     if img is None:
         return None
-    arr = np.frombuffer(img, np.uint8).reshape((h, w, 4))       # Webots frame is BGRA
+    arr = np.frombuffer(img, np.uint8).reshape((h, w, 4))  
     bgr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
 
 def _get_depth_cm():
-    """Depth range image as an int16 numpy array in centimetres (-1 = invalid)."""
     data, w, h = _read_depth_image()
     if data is None:
         return None
-    depth = np.asarray(data, dtype=np.float32).reshape((h, w)) * 100.0  # m -> cm
+    depth = np.asarray(data, dtype=np.float32).reshape((h, w)) * 100.0 
     depth = np.where(np.isinf(depth), -1.0, depth)
     return depth.astype(np.int16)
 
 
 def _segment_color(hsv, color):
-    """Binary mask (uint8 0/255) of pixels within the HSV band for `color`."""
     band = _HSV_BANDS.get(color)
     if band is None or hsv is None:
         return None
@@ -112,26 +101,16 @@ def _segment_color(hsv, color):
 
 
 def _resize_mask_to(mask, shape_hw):
-    """Nearest-neighbour resize a mask to (h, w) so it aligns with the depth grid."""
     if mask.shape == shape_hw:
         return mask
     return cv2.resize(mask, (shape_hw[1], shape_hw[0]), interpolation=cv2.INTER_NEAREST)
 
 
 def _column_fully_in_frame(mask, top_strip=COLUMN_TOP_STRIP_PX):
-    """True if no column pixels touch the top strip (column not clipped at top)."""
     return int(np.count_nonzero(mask[:top_strip, :])) == 0
 
 
 def _estimate_column_distance_cm(mask, depth_cm):
-    """Horizontal distance (cm) to a colour column from depth + known height.
-
-    Ported from AURE estimate_column_distance: take the far depth over the
-    column mask, correct for a column clipped at the top of frame, then remove
-    the known vertical component (COLUMN_HEIGHT_CM) via Pythagoras.  Returns
-    None when unmeasurable, or a small "close" value when the column fills the
-    frame but depth is invalid (very near — depth saturates on contact).
-    """
     if mask is None or depth_cm is None or not np.any(mask):
         return None
 
@@ -148,19 +127,12 @@ def _estimate_column_distance_cm(mask, depth_cm):
         max_depth_cm *= 1.25 if max_depth_cm < 110.0 else 1.1
 
     if max_depth_cm <= COLUMN_HEIGHT_CM:
-        return float(np.mean(valid))   # too close for the height correction
+        return float(np.mean(valid))  
     horizontal = math.sqrt(max_depth_cm ** 2 - COLUMN_HEIGHT_CM ** 2)
     return horizontal + COLUMN_DIST_OFFSET_CM
 
 
 def _pixel_to_bearing(col, w, fov):
-    """Convert image column to body-frame bearing in radians.
-
-    Sign convention (matches reactive.py laser sectors):
-        col = 0       → +fov/2  (target on robot's left, +y body)
-        col = w - 1   → -fov/2  (target on robot's right, -y body)
-    Returns None for degenerate inputs.
-    """
     if w is None or w <= 1 or fov is None:
         return None
     return 0.5 * fov * (1.0 - 2.0 * col / (w - 1))
@@ -176,7 +148,6 @@ def _read_rgb_fov():
     return fov if fov is not None and math.isfinite(fov) else None
 
 
-# Cached at import time — RGB camera FOV does not change at runtime.
 _rgb_fov = _read_rgb_fov()
 
 
@@ -190,7 +161,6 @@ def _read_depth_fov():
     return fov if fov is not None and math.isfinite(fov) else None
 
 
-# Cached at import time — depth camera FOV does not change at runtime.
 _depth_fov = _read_depth_fov()
 
 
@@ -204,12 +174,6 @@ def _read_scalar(sensor):
 
 
 def read_wheel_angles():
-    """Return (left_rad, right_rad) — averaged cumulative wheel angles.
-
-    Front and rear wheels on the same side share a motor command, so their
-    encoders should agree closely; the average is robust to small jitter.
-    Returns (None, None) if any encoder is unavailable.
-    """
     fl = _read_scalar(devices.fl_wheel_sensor)
     fr = _read_scalar(devices.fr_wheel_sensor)
     rl = _read_scalar(devices.rl_wheel_sensor)
@@ -220,12 +184,6 @@ def read_wheel_angles():
 
 
 def read_imu_yaw():
-    """Return the inertial-unit yaw in radians, or None if unavailable.
-
-    Webots' InertialUnit returns absolute world-frame roll/pitch/yaw; we
-    take element [2].  No baseline subtraction here — that belongs to the
-    pose layer, which captures a baseline on reset.
-    """
     rpy = _read_vector(devices.inertial_unit, "getRollPitchYaw")
     if rpy is None:
         return None
@@ -234,12 +192,6 @@ def read_imu_yaw():
 
 
 def read_gyro_z():
-    """Return the IMU gyro yaw rate (rad/s about +z), or None if unavailable.
-
-    Element [2] is the z-axis (yaw) angular rate in the robot's Z-up frame.
-    Unlike wheel encoders, the gyro measures true inertial body rotation, so
-    wheel slip cannot fake it — this feeds the localization slip gate.
-    """
     vals = _read_vector(devices.gyro, "getValues")
     if vals is None:
         return None
@@ -248,12 +200,6 @@ def read_gyro_z():
 
 
 def read_laser_scan():
-    """Return (ranges, fov_rad, max_range_m) for the laser, or (None, None, None).
-
-    `ranges` is the raw range image (index 0 = leftmost ray, matching
-    reactive.py's sector convention).  Caller is responsible for
-    rejecting inf, near-zero, and near-max-range readings.
-    """
     laser = devices.laser
     if laser is None:
         return None, None, None
@@ -269,13 +215,6 @@ def read_laser_scan():
 
 
 def green_ground_points_body():
-    """Project detected green-ground pixels onto the floor plane.
-
-    Returns Nx2 body-frame points [x_forward, y_left] (metres) via an inverse
-    pinhole model (camera intrinsics from FOV + mounting height).  Only the
-    lower image is trusted (ground), and points are subsampled for cost.
-    Empty (0, 2) array when no green is visible or the camera is unavailable.
-    """
     empty = np.empty((0, 2), dtype=np.float64)
     hsv = _get_hsv_image()
     if hsv is None or _rgb_fov is None:
@@ -284,39 +223,31 @@ def green_ground_points_body():
     if mask is None:
         return empty
     h, w = mask.shape
-    mask[:int(GREEN_ROI_TOP_FRAC * h), :] = 0     # trust only the lower image (floor)
-    vs, us = np.where(mask == 255)                # rows (v), cols (u)
-    if us.size < GREEN_MARK_MIN_PIXELS:           # reject stray green (noise -> streaks)
+    mask[:int(GREEN_ROI_TOP_FRAC * h), :] = 0    
+    vs, us = np.where(mask == 255)               
+    if us.size < GREEN_MARK_MIN_PIXELS:          
         return empty
-    if us.size > 400:                             # subsample dense masks
+    if us.size > 400:                            
         idx = np.linspace(0, us.size - 1, 400).astype(int)
         us, vs = us[idx], vs[idx]
 
     fx = w / (2.0 * math.tan(_rgb_fov / 2.0))
     cx, cy = w / 2.0, h / 2.0
     x_norm = (us - cx) / fx
-    y_norm = (vs - cy) / fx                        # square pixels: fy == fx
+    y_norm = (vs - cy) / fx                       
 
-    # Forward distance on the floor: D = camera_height / y_norm (y_norm below horizon).
     D = GREEN_CAM_HEIGHT_M / (y_norm + 1e-6)
     valid = (y_norm > 0.001) & (D > 0.1) & (D < GREEN_MAX_PROJ_DIST)
     D, x_norm = D[valid], x_norm[valid]
     if D.size == 0:
         return empty
 
-    bx = D + GREEN_CAM_X_OFFSET                     # forward
-    by = -D * x_norm                                # left (+) / right (-)
+    bx = D + GREEN_CAM_X_OFFSET                    
+    by = -D * x_norm                             
     return np.stack([bx, by], axis=1)
 
 
 def read_lidar_pointcloud_2d():
-    """Return Nx2 lidar points [x_forward, y_left] in the robot body frame.
-
-    Reads the laser point cloud (requires laser.enablePointCloud(), done in
-    devices.py), drops non-finite points, and returns an (N, 2) float array.
-    Returns an empty (0, 2) array when the lidar is unavailable or the cloud
-    is empty.  This is the map layer's sole lidar input.
-    """
     laser = devices.laser
     empty = np.empty((0, 2), dtype=np.float64)
     if laser is None:
@@ -334,9 +265,6 @@ def read_lidar_pointcloud_2d():
     pts = pts[finite]
     if pts.shape[0] == 0:
         return empty
-    # Full-range point cloud (matches the reference get_pointcloud_2d): no distance
-    # cap.  With 30 particles the pose is accurate enough that far returns don't
-    # smear; SLAM downsamples the scan (SLAM_SCAN_MAX_BEAMS) itself.
     return pts
 
 
@@ -377,29 +305,18 @@ def _read_depth_center():
         return None
     return w, h, data[h // 2 * w + w // 2]
 
-# Upper-frame depth ROIs shared by overhead_depth_regions(),
-# overhead_depth_region_values(), and overhead_obstacle_points_body() — a
-# floating wall sits above the lidar's scan plane, so these are the only
-# sensor evidence of it.
+
 _OVERHEAD_ROIS = {
     "left":   (0.05, 0.40, 0.02, 0.55),
     "center": (0.25, 0.75, 0.02, 0.55),
     "right":  (0.60, 0.95, 0.02, 0.55),
 }
 
-# Overhead band for the PER-PIXEL projection (overhead_obstacle_points_body):
-# the union of the three ROIs above (cols 0.05-0.95, rows 0.02-0.55).  Unlike
-# the coarse per-ROI "near" scalar used by the two functions above, every
-# pixel in this band keeps its OWN column's bearing, so the projected point
-# lines up with the pixel it actually came from instead of a shared
-# ROI-centre bearing (which put points at the wrong angle -- see
-# overhead_obstacle_points_body's docstring).
 _OVERHEAD_BAND_COL_FRAC = (0.05, 0.95)
 _OVERHEAD_BAND_ROW_FRAC = (0.02, 0.63)
 
 
 def _overhead_roi_near_depth(data, w, h, x0f, x1f, y0f, y1f):
-    """Robust (5th-percentile) nearest valid depth (m) within one ROI, or inf."""
     col_start = int(x0f * w)
     col_end   = int(x1f * w)
     row_start = int(y0f * h)
@@ -420,13 +337,6 @@ def _overhead_roi_near_depth(data, w, h, x0f, x1f, y0f, y1f):
 
 
 def overhead_depth_regions(max_distance):
-    """Detect overhead/floating obstacles in upper-left, upper-center, upper-right depth ROIs.
-
-    Returns:
-        detected: bool
-        region_name: "left", "center", "right", or "none"
-        depth_value: robust nearest depth in detected region, or inf
-    """
     data, w, h = _read_depth_image()
     if data is None:
         return False, "none", INF
@@ -445,11 +355,6 @@ def overhead_depth_regions(max_distance):
 
 
 def overhead_depth_region_values():
-    """Return robust depth values for overhead left/center/right ROIs.
-
-    These are the same ROIs used by overhead_depth_regions().
-    Returns inf for a region if no valid depth pixels exist.
-    """
     data, w, h = _read_depth_image()
     if data is None:
         return {
@@ -465,36 +370,6 @@ def overhead_depth_region_values():
 
 
 def overhead_obstacle_points_body():
-    """Project nearby floating/overhead obstacles onto the floor as body-frame
-    points, for marking into the occupancy grid (mapping.mark_overhead).
-
-    Per-pixel projection over the overhead band (_OVERHEAD_BAND_*): every
-    valid depth pixel within OVERHEAD_DETECT_DIST is converted to a body-frame
-    (x_forward, y_left) point using the SAME pinhole-ray decomposition as
-    green_ground_points_body (fx/x_norm/y_norm, "square pixels" -> fy == fx),
-    except the measured depth is used directly as the ray length (unlike the
-    ground projection, which instead assumes the point lies on a KNOWN-height
-    floor plane) -- a floating obstacle's height is unknown, so its range must
-    be decomposed geometrically via the pixel's own (x_norm, y_norm) instead.
-
-    This must NOT be simplified to a single "nearest depth in the ROI" + a
-    shared ROI-centre bearing: the nearest pixel can sit anywhere across the
-    ~30%-wide ROI, and ignoring the vertical angle over-estimates the forward
-    range for off-centre rows -- both put the point well off the obstacle's
-    true position, scattering marks across the map instead of tracing its true
-    shape (as lidar rasterization does by using each ray's own angle).  Points
-    are subsampled for cost.
-
-    Height gate: some floating walls sit high enough that the robot can drive
-    underneath; only points whose real-world height above the floor is at/below
-    OVERHEAD_ROBOT_CLEARANCE_M are kept (those actually block the robot's
-    body).  Height is recovered from the same pinhole ray (OVERHEAD_CAM_HEIGHT_M
-    minus the ray's vertical rise), not assumed from image row alone, so it
-    differentiates a genuinely low wall from one whose gap the robot clears.
-
-    Returns an (N, 2) array; empty (0, 2) when too few pixels qualify, none
-    are low enough to block, or the depth camera is unavailable.
-    """
     empty = np.empty((0, 2), dtype=np.float64)
     data, w, h = _read_depth_image()
     if data is None or _depth_fov is None:
@@ -516,7 +391,7 @@ def overhead_obstacle_points_body():
         rows, cols = rows[idx], cols[idx]
 
     d = band[rows, cols]
-    cols_full = cols + col0                      # back to full-image indices
+    cols_full = cols + col0                     
     rows_full = rows + row0
 
     fx = w / (2.0 * math.tan(_depth_fov / 2.0))
@@ -525,12 +400,9 @@ def overhead_obstacle_points_body():
     y_norm = (rows_full - cy) / fx
     ray_norm = np.sqrt(x_norm ** 2 + y_norm ** 2 + 1.0)
 
-    bx = d / ray_norm                 # forward
-    by = -d * x_norm / ray_norm       # left (+) / right (-)
+    bx = d / ray_norm              
+    by = -d * x_norm / ray_norm    
 
-    # Height above the floor at each point: camera mount height minus the
-    # ray's vertical rise (y_norm < 0 above the optical centre -> positive
-    # rise -> point sits above camera height, as expected for "overhead").
     height_above_floor = OVERHEAD_CAM_HEIGHT_M - d * y_norm / ray_norm
     blocking = height_above_floor <= OVERHEAD_ROBOT_CLEARANCE_M
     if not np.any(blocking):
@@ -541,7 +413,6 @@ def overhead_obstacle_points_body():
 
 
 def get_front_laser_min():
-    """Minimum range in the laser's front-centre band (40% to 60% of rays)."""
     if devices.laser is None:
         return INF
     try:
@@ -560,13 +431,6 @@ def get_front_laser_min():
 
 
 def read_color_detections():
-    """Detect blue/yellow columns and green ground via HSV segmentation.
-
-    AURE's cv2 approach: blue/yellow report a bearing (from the mask centroid)
-    and a depth+height distance estimate; green reports a lower-image ratio and
-    a depth-sampled distance.  The return schema is kept stable for the reactive
-    stack (autonomous.py, the P key) — this swaps only the detection engine.
-    """
     result = {
         "green":  False, "green_ratio":  0.0, "green_distance": INF,
         "blue":   False, "blue_ratio":   0.0,
@@ -581,7 +445,6 @@ def read_color_detections():
     h, w = hsv.shape[:2]
     depth_cm = _get_depth_cm()
 
-    # ── Green ground: trusted only in the lower image ─────────────────────────
     green_mask = _segment_color(hsv, "green")
     if green_mask is not None:
         top = int(GREEN_ROI_TOP_FRAC * h)
@@ -595,9 +458,8 @@ def read_color_detections():
             gd = depth_cm[gm != 0]
             gd = gd[gd > 0]
             if gd.size:
-                result["green_distance"] = float(np.min(gd)) / 100.0   # cm -> m
+                result["green_distance"] = float(np.min(gd)) / 100.0  
 
-    # ── Blue / yellow columns ─────────────────────────────────────────────────
     for color in ("blue", "yellow"):
         mask = _segment_color(hsv, color)
         if mask is None:
@@ -615,13 +477,12 @@ def read_color_detections():
 
         dist_cm = _estimate_column_distance_cm(mask, depth_cm)
         if dist_cm is not None:
-            result[f"{color}_distance_m"] = dist_cm / 100.0   # cm -> m
+            result[f"{color}_distance_m"] = dist_cm / 100.0  
 
     return result
 
 
 def read_sensor_snapshot():
-    """Read every enabled sensor and return a readings dict for sensor_debug."""
     r = {}
 
     r["enc_fl"] = _read_scalar(devices.fl_wheel_sensor)
