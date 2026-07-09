@@ -335,7 +335,7 @@ APPROACH_OFFSET_M         = 0.30  # m     — A* stand-off in front of a pillar;
 # follow_final_path reached-logic): it fills the view, OR the front laser is at
 # contact range while the pillar is centred.  The depth distance is used only to
 # navigate TOWARD a pillar (direction), never to confirm arrival.
-MISSION_MARK_RATIO        = 0.20  # frame fraction a pillar must fill to count as reached (ref 0.20)
+MISSION_MARK_RATIO        = 0.30  # frame fraction a pillar must fill to count as reached (ref 0.20)
 MISSION_MARK_LASER_M      = 0.35  # m   — front-laser contact range that confirms a centred pillar (ref 0.35)
 MISSION_MARK_BEARING_RAD  = 0.25  # rad — |pillar bearing| must be within this to trust the laser signal
 MISSION_MARK_MAX_STAMP_M  = 0.60  # m   — clamp for where the pillar cell is stamped (reliable close range)
