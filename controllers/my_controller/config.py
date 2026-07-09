@@ -26,7 +26,7 @@ OVERHEAD_MARK_MIN_PIXELS = 8   # min valid depth pixels in the overhead band bef
 
 # Height gate for floating-wall marking: some floating walls sit high enough
 # that the robot can drive underneath; others sit low enough to hit the body.
-# These are DEDICATED to the overhead/floating-wall height math -- kept
+# These are DEDICATED to the overhead/floating-wall height math -- 
 # separate from GREEN_CAM_HEIGHT_M / GREEN_CAM_X_OFFSET (the ground-projection
 # constants) even though it is physically the same depth camera, so the two
 # features can be tuned independently without touching each other.
@@ -166,9 +166,9 @@ DWA_CLEARANCE_WEIGHT = 2.0   # reward staying away from obstacles
 # no hard reject, so a genuinely tight corridor still yields the least-bad move
 # instead of a stuck refusal) any rollout whose clearance to a known wall drops
 # below the robot's half-width.
-DWA_ROBOT_CLEAR_PX   = 4.0   # robot half-width in cells (~0.133 m); keep this much wall clearance
+DWA_ROBOT_CLEAR_PX   = 3.5   # robot half-width in cells (~0.133 m); keep this much wall clearance
                              # (bumped up from 3.0/~0.10 m for extra margin against clipping)
-DWA_CLEAR_PENALTY    = 4.0   # score penalty per cell of encroachment below DWA_ROBOT_CLEAR_PX
+DWA_CLEAR_PENALTY    = 3.5   # score penalty per cell of encroachment below DWA_ROBOT_CLEAR_PX
 # Live-lidar speed governor: DWA only avoids MAPPED obstacles, so while exploring
 # UNKNOWN space (treated as free) the robot charges unmapped walls at full speed
 # until the binary bumper trips too late -> ram/reverse/replan thrash.  Scale the

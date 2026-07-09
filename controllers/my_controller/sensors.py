@@ -395,7 +395,7 @@ _OVERHEAD_ROIS = {
 # ROI-centre bearing (which put points at the wrong angle -- see
 # overhead_obstacle_points_body's docstring).
 _OVERHEAD_BAND_COL_FRAC = (0.05, 0.95)
-_OVERHEAD_BAND_ROW_FRAC = (0.02, 0.55)
+_OVERHEAD_BAND_ROW_FRAC = (0.02, 0.63)
 
 
 def _overhead_roi_near_depth(data, w, h, x0f, x1f, y0f, y1f):
