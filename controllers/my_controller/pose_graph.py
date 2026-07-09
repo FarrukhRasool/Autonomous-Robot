@@ -1,16 +1,3 @@
-"""Sparse pose-graph SLAM backend: keyframes, scan-matched loop closure, and
-nonlinear pose-graph optimization.  Used by slam.py to detect when the robot
-revisits a previously-mapped area and correct accumulated odometry drift.
-
-Faithful port of the reference project's pose_graph.py (Hieu Tran et al.).
-Only two adaptations, neither changing behaviour:
-  * `from CONSTANTS import ...` -> `from config import ...` (LOGODDS_INIT aliased
-    to the reference's INITIAL_LOG_ODD name).
-  * `rasterize_scan` is imported lazily inside rebuild_log_odds (from this
-    project's mapping module) so this file is self-contained.
-
-Pure NumPy / SciPy — no Webots imports.
-"""
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
@@ -30,7 +17,6 @@ def wrap_angle(a):
 
 
 def relative_pose(pose_a, pose_b):
-    """SE2 relative pose of b expressed in a's frame (a^-1 * b)."""
     ax, ay, ath = pose_a
     bx, by, bth = pose_b
     dx, dy = bx - ax, by - ay
@@ -42,7 +28,6 @@ def relative_pose(pose_a, pose_b):
 
 
 def transform_points(points, pose):
-    """Transform local-frame 2D points into the world frame given by pose (x, y, theta)."""
     if len(points) == 0:
         return np.asarray(points).reshape(0, 2)
     x, y, theta = pose
@@ -52,11 +37,6 @@ def transform_points(points, pose):
 
 
 def apply_rigid_correction(poses, old_anchor, new_anchor):
-    """Rigidly rotate+translate a batch of world-frame poses (N, 3) so that
-    `old_anchor` maps exactly onto `new_anchor`, preserving the poses' relative
-    structure.  Used to re-anchor the whole particle cloud after a loop-closure
-    correction shifts the trajectory's most recent keyframe.
-    """
     poses = np.asarray(poses, dtype=np.float64)
     dtheta = wrap_angle(new_anchor[2] - old_anchor[2])
     c, s = np.cos(dtheta), np.sin(dtheta)
@@ -70,15 +50,6 @@ def apply_rigid_correction(poses, old_anchor, new_anchor):
 
 
 def _correlative_match(current_scan_local, cand_scan_local, init_rel):
-    """Coarse correlative scan match around `init_rel`.
-
-    Searches a small (dx, dy, dtheta) window around `init_rel` (the relative pose
-    of the current keyframe in the candidate keyframe's frame, per the current
-    pose-graph estimate) for the transform that best aligns `current_scan_local`
-    onto `cand_scan_local`.  Scored by mean nearest-neighbor distance (cKDTree).
-
-    Returns (best_score, best_rel).
-    """
     tree = cKDTree(cand_scan_local)
 
     dx_vals = np.arange(-LOOP_CLOSURE_SEARCH_WINDOW_M, LOOP_CLOSURE_SEARCH_WINDOW_M + 1e-9, LOOP_CLOSURE_SEARCH_STEP_M)
@@ -96,9 +67,8 @@ def _correlative_match(current_scan_local, cand_scan_local, init_rel):
     for dth in dth_vals:
         theta = init_rel[2] + dth
         c, s = np.cos(theta), np.sin(theta)
-        rotated = current_scan_local @ np.array([[c, -s], [s, c]]).T  # (num_points, 2)
+        rotated = current_scan_local @ np.array([[c, -s], [s, c]]).T 
 
-        # (num_offsets, num_points, 2) -> flatten for a single batched KD-tree query
         translated = rotated[None, :, :] + base_xy[:, None, :]
         flat = translated.reshape(-1, 2)
         dists, _ = tree.query(flat, k=1)
@@ -113,19 +83,14 @@ def _correlative_match(current_scan_local, cand_scan_local, init_rel):
 
 
 class PoseGraphSLAM:
-    """Sparse pose graph over SLAM keyframes with scan-matched loop closure."""
 
     def __init__(self):
-        self.nodes = []   # list of np.array([x, y, theta]) world-frame keyframe poses
-        self.scans = []   # list of np.ndarray (N, 2) local-frame lidar points per keyframe
-        self.edges = []   # list of (i, j, rel_pose) sequential + loop constraints
+        self.nodes = []  
+        self.scans = []  
+        self.edges = [] 
         self.loop_closure_count = 0
 
     def add_keyframe(self, pose, local_scan):
-        """Add a keyframe if the robot moved/turned enough since the last one.
-
-        Returns the new node index, or None if no keyframe was added.
-        """
         pose = np.array(pose, dtype=np.float64)
         local_scan = np.asarray(local_scan, dtype=np.float64)
 
@@ -148,10 +113,6 @@ class PoseGraphSLAM:
         return new_index
 
     def try_loop_closure(self, node_index):
-        """Attempt to find and accept a loop-closure edge for `node_index`.
-
-        Returns True if a loop-closure edge was added.
-        """
         if node_index is None or node_index < LOOP_CLOSURE_MIN_KEYFRAME_GAP:
             return False
 
@@ -194,11 +155,6 @@ class PoseGraphSLAM:
         return True
 
     def optimize(self):
-        """Run pose-graph optimization over all sequential + loop edges.
-
-        Returns corrected node poses as a list of np.array([x, y, theta]); does not
-        mutate self.nodes (caller decides when/whether to commit the correction).
-        """
         if len(self.nodes) < 2:
             return [n.copy() for n in self.nodes]
 
@@ -213,8 +169,6 @@ class PoseGraphSLAM:
                 err = predicted - rel
                 err[2] = wrap_angle(err[2])
                 res.append(err)
-            # Anchor the first node so the graph can't drift/rotate as a whole
-            # (pose graphs are only defined up to a global rigid transform).
             anchor_err = poses[0] - anchor
             anchor_err[2] = wrap_angle(anchor_err[2])
             res.append(anchor_err * 10.0)
@@ -225,10 +179,7 @@ class PoseGraphSLAM:
         return [pose.copy() for pose in corrected]
 
     def rebuild_log_odds(self, corrected_poses, map_size, resolution, world_to_map_fn):
-        """Re-rasterize every stored keyframe scan at its corrected pose into a
-        fresh log-odds array.  This is the map "deskew" step after a loop closure.
-        """
-        from mapping import rasterize_scan   # lazy: mapping primitive lands in M2
+        from mapping import rasterize_scan 
 
         log_odds = np.full((map_size, map_size), INITIAL_LOG_ODD, dtype=np.float32)
         for pose, scan_local in zip(corrected_poses, self.scans):
