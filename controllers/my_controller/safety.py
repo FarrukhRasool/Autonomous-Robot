@@ -1,17 +1,3 @@
-"""Reactive safety net for the Husarion RosBot.
-
-The hard-constraint override applied to EVERY autonomous twist (explore,
-follow, ...) right before it reaches the motors, regardless of which planner
-produced it.  It mirrors the emergency logic already in autonomous.py so the
-new navigation stack honours the same constraints:
-
-    1. Front collision  — laser front OR fl/fr range < FRONT_STOP_DIST.
-    2. Rear collision    — on reverse, rl/rr range < REAR_SAFE_DIST.
-    3. Green ground      — forbidden terrain: stop / slow / turn away.
-
-Call apply(v, omega) -> (v, omega, label); label is "" when nothing fired.
-"""
-
 import devices
 import sensors
 from reactive import laser_5_sectors
@@ -25,13 +11,10 @@ from config import (
 
 INF = float("inf")
 
-# Latched front-block state (mirrors autonomous.py's wall-block hysteresis):
-# once blocked, keep turning toward the chosen open side until the front is
-# *properly* clear; if turning fails to clear it, reverse out (dead-end escape).
 _front_latched = False
-_front_side = 1.0        # +1 => turn left (toward open), -1 => turn right
-_block_count = 0         # consecutive ticks the front has stayed blocked
-_reverse_count = 0       # >0 while a reverse escape is in progress
+_front_side = 1.0       
+_block_count = 0      
+_reverse_count = 0     
 
 
 def _range(sensor):
@@ -42,11 +25,6 @@ def _range(sensor):
 
 
 def apply(v_cmd, omega_cmd, colors=None):
-    """Override the commanded twist to enforce the hard safety constraints.
-
-    `colors` may be passed in to reuse an already-computed detection dict
-    (avoids a second camera read); otherwise it is read here.
-    """
     global _front_latched, _front_side, _block_count, _reverse_count
     label = ""
 
@@ -65,17 +43,12 @@ def apply(v_cmd, omega_cmd, colors=None):
     if colors is None:
         colors = sensors.read_color_detections()
 
-    # 1) Front collision — decisive latched turn, escalating to a reverse escape.
-    #    Turn toward the open side until the front clears FRONT_BLOCK_DIST.  If
-    #    turning fails to clear it within the timeout (dead-end / tight corner),
-    #    reverse out — the only way to escape a corner — then try the other side.
     reversing_cmd = v_cmd < -1e-3
     rear_clear = (rl > REAR_SAFE_DIST) and (rr > REAR_SAFE_DIST)
     block_now = (center_min < FRONT_STOP_DIST) or (fl < FRONT_STOP_DIST) or (fr < FRONT_STOP_DIST)
     clear_now = (center_min > FRONT_BLOCK_DIST) and (fl > FRONT_BLOCK_DIST) and (fr > FRONT_BLOCK_DIST)
 
     if not reversing_cmd:
-        # Maintain the block latch and how long we have been blocked.
         if block_now:
             if not _front_latched:
                 _front_side = 1.0 if left_min >= right_min else -1.0
@@ -89,8 +62,6 @@ def apply(v_cmd, omega_cmd, colors=None):
             _block_count = 0
 
         if _reverse_count > 0:
-            # Reverse escape in progress: arc backward (reverse + turn) so we
-            # back out of the pocket AND re-orient to a new heading.
             _reverse_count -= 1
             if rear_clear:
                 v_cmd, omega_cmd = FRONT_ESCAPE_REVERSE_VEL, _front_side * FRONT_ESCAPE_TURN_OMEGA
@@ -100,7 +71,6 @@ def apply(v_cmd, omega_cmd, colors=None):
                 label = "block_reverse_turn"
         elif _front_latched:
             if _block_count >= FRONT_BLOCK_TIMEOUT_STEPS and rear_clear:
-                # Turning hasn't cleared it — reverse out, then try the other way.
                 _reverse_count = FRONT_ESCAPE_REVERSE_STEPS
                 _front_latched = False
                 _block_count = 0
@@ -112,13 +82,11 @@ def apply(v_cmd, omega_cmd, colors=None):
                 omega_cmd = _front_side * TARGET_ANG_VEL
                 label = "front_block_turn_left" if _front_side > 0 else "front_block_turn_right"
 
-    # 2) Rear collision safety: never reverse into a close rear obstacle.
     if v_cmd < 0 and not rear_clear:
         v_cmd = 0.0
         omega_cmd = _front_side * TARGET_ANG_VEL
         label = "rear_blocked"
 
-    # 3) Green ground: forbidden terrain — stop / slow / turn toward the open side.
     if colors["green"] and v_cmd > 0:
         open_sign = 1.0 if left_min >= right_min else -1.0
         green_dist = colors["green_distance"]
