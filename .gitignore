@@ -1,0 +1,7 @@
+# macOS Finder metadata
+.DS_Store
+
+# Agent tooling / instructions — local, not part of the deliverable
+.claude/
+CLAUDE.md
+AGENTS.md
