@@ -1,4 +1,4 @@
-# Autonomous RosBot — Webots Maze Navigation
+# Autonomous RosBot: Webots Maze Navigation
 
 > **Accuracy note.** This README was written by reading the source. Where a claim
 > comes from something other than code (a comment, an inference, a guess), it is
