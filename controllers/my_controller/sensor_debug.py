@@ -1,20 +1,5 @@
-"""Sensor snapshot formatting and plausibility checks for the Husarion RosBot.
-
-Pure Python — no Webots imports.  Receives already-read values from the
-controller and returns formatted strings for the Webots console.
-
-Plausibility rules are intentionally generous: we flag [WARN] only for
-values that are outright broken (NaN, inf, out of physical range), not
-for values that are merely unexpected.  Calibration belongs in later
-milestones.
-"""
-
 import math
 
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _ok(flag):
     return "[OK]  " if flag else "[WARN]"
@@ -34,28 +19,16 @@ def _mag(v):
     return math.sqrt(sum(x * x for x in v))
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def is_plausible(name, value):
-    """Return True if value is within expected range for sensor key name.
-
-    name  — readings-dict key, e.g. 'enc_fl', 'accel', 'range_fl'.
-    value — already-read Python object (float, tuple, etc.).
-    Returns False for None or non-finite values.
-    """
     if value is None:
         return False
     if name.startswith("enc_"):
         return _fin(value)
     if name == "accel":
-        # Gravity magnitude at rest: ~9.81 m/s².  Allow generous band.
         return _vecfin(value) and 5.0 < _mag(value) < 15.0
     if name == "gyro":
         return _vecfin(value)
     if name == "compass":
-        # Webots compass returns a unit-normalised magnetic field vector.
         return _vecfin(value) and 0.8 < _mag(value) < 1.2
     if name == "imu_rpy":
         return _vecfin(value)
@@ -93,20 +66,8 @@ def is_plausible(name, value):
 
 
 def format_sensor_snapshot(readings):
-    """Return a multi-line sensor-snapshot string with OK / WARN / MISS tags.
-
-    Expected keys in readings (all optional — missing keys get [MISS]):
-      enc_fl, enc_fr, enc_rl, enc_rr         float (rad, cumulative wheel angle)
-      accel, gyro, compass, imu_rpy           tuple[3] of float
-      range_fl, range_fr, range_rl, range_rr  float (m)
-      laser_count                             int   (number of rays)
-      laser_min, laser_max, laser_mean        float (m)
-      cam_rgb    (width, height, (R, G, B))   or None
-      cam_depth  (width, height, center_m)    or None
-    """
     lines = ["=" * 46, "         SENSOR SNAPSHOT", "=" * 46]
 
-    # -- Encoders --
     lines.append("ENCODERS  (cumulative wheel angle, rad)")
     for key in ("enc_fl", "enc_fr", "enc_rl", "enc_rr"):
         v = readings.get(key)
@@ -117,7 +78,6 @@ def format_sensor_snapshot(readings):
                 f"  {key:10s}: {v:+11.4f} rad  {_ok(is_plausible(key, v))}"
             )
 
-    # -- IMU --
     lines.append("IMU")
     v = readings.get("accel")
     if v is None:
@@ -157,7 +117,6 @@ def format_sensor_snapshot(readings):
             f"  yaw={v[2]:+.4f} rad  {_ok(is_plausible('imu_rpy', v))}"
         )
 
-    # -- Range sensors --
     lines.append("RANGE SENSORS  (m)")
     for key in ("range_fl", "range_fr", "range_rl", "range_rr"):
         v = readings.get(key)
@@ -169,7 +128,6 @@ def format_sensor_snapshot(readings):
                 f"  {key:12s}: {val_str:14s}  {_ok(is_plausible(key, v))}"
             )
 
-    # -- Laser --
     lines.append("LASER")
     count = readings.get("laser_count")
     if count is None:
@@ -184,7 +142,6 @@ def format_sensor_snapshot(readings):
             f"  mean={lmean:.3f}m  {_ok(ok)}"
         )
 
-    # -- Cameras --
     lines.append("CAMERAS")
     v = readings.get("cam_rgb")
     if v is None:
@@ -240,11 +197,6 @@ def format_sensor_snapshot(readings):
 
 
 def format_compact_sensors(readings):
-    """Return a single-line compact sensor summary for per-step logging.
-
-    Covers one value from each sensor group so a quick eye-scan confirms
-    all groups are live.
-    """
     enc = readings.get("enc_fl")
     enc_str = f"{enc:+.2f}" if _fin(enc) else "?"
 
