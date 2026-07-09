@@ -1,17 +1,3 @@
-"""Global path planner for the Husarion RosBot — A* + clearance + spline.
-
-Ported from AURE (astar_2_spline.runAStarSearch + GridMap.find_path).  Pure
-NumPy / SciPy / OpenCV — no Webots imports; operates on an occupancy-grid
-snapshot from mapping.get_grid().  Produces a collision-free, clearance-biased,
-spline-smoothed route between two map cells.
-
-Conventions (match mapping.py): grid is uint8, indexed [row=y, col=x], with
-CELL_FREE=0 / CELL_OCC=1 / CELL_UNKNOWN=255 / CELL_CLOSED / CELL_GREEN.  Cells
-are addressed as (x, y) = (col, row) tuples throughout, as in AURE.  UNKNOWN is
-treated as traversable by the planner (the map is inflated to a binary
-free/obstacle grid before search), matching AURE's global find_path.
-"""
-
 import heapq
 import math
 
@@ -29,10 +15,7 @@ from config import (
 )
 
 
-# ── Morphology preprocessing (cv2), ported from AURE utils ────────────────────
-
 def _clean_small_components(grid, min_size=6, connectivity=4):
-    """Drop obstacle blobs smaller than min_size px; leave other cell values intact."""
     binary = np.where(grid == CELL_OCC, 255, 0).astype(np.uint8)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=connectivity)
     keep = np.zeros_like(binary)
@@ -45,11 +28,6 @@ def _clean_small_components(grid, min_size=6, connectivity=4):
 
 
 def _remove_noisy_pixels(grid, connectivity=4):
-    """Binary obstacle map (0/1) with isolated single-pixel obstacles removed.
-
-    Keeps obstacle components with area > 1; every other cell (incl. UNKNOWN)
-    becomes free — matching AURE remove_noisy_pixels.
-    """
     binary = np.where(grid == CELL_OCC, 255, 0).astype(np.uint8)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=connectivity)
     cleaned = np.zeros_like(binary)
@@ -60,7 +38,6 @@ def _remove_noisy_pixels(grid, connectivity=4):
 
 
 def _inflate_obstacles(binary, inflation_px):
-    """Dilate obstacles by an elliptical kernel; returns a binary 0/1 map."""
     k = int(2 * inflation_px + 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
     src = np.where(binary == CELL_OCC, 255, 0).astype(np.uint8)
@@ -69,11 +46,6 @@ def _inflate_obstacles(binary, inflation_px):
 
 
 def _expand_free_disk(grid, cell, radius_px):
-    """Set a filled disk of radius_px around (x, y) cell to free (0), in place.
-
-    Guarantees the start/goal endpoints are reachable even when inflation would
-    otherwise bury them inside an obstacle.
-    """
     h, w = grid.shape
     x, y = int(cell[0]), int(cell[1])
     r2 = radius_px * radius_px
@@ -85,20 +57,16 @@ def _expand_free_disk(grid, cell, radius_px):
                     grid[ny, nx] = 0
 
 
-# ── A* with clearance penalty + spline smoothing ──────────────────────────────
-
 def _reconstruct(parent, cy, cx):
-    """Walk the parent map back to the start; return [(x, y), ...] start->goal."""
     path = []
     cur = [cy, cx]
     while cur[0] != -1:
-        path.append((cur[1], cur[0]))   # (x, y)
+        path.append((cur[1], cur[0]))  
         cur = parent[cur[0], cur[1]]
     return path[::-1]
 
 
 def _smooth_path(path, smoothness=0.1):
-    """B-spline smooth a cell path; returns de-duplicated integer (x, y) cells."""
     if len(path) < 4:
         return path
     arr = np.array(path, dtype=float)
@@ -120,18 +88,10 @@ def _smooth_path(path, smoothness=0.1):
 
 
 def _run_astar(binary_map, start, goal):
-    """A* over a binary free(0)/obstacle(nonzero) map with a clearance penalty.
-
-    start/goal are (x, y) = (col, row) cells.  8-connected with 2-px steps and a
-    x1.2 Euclidean heuristic; the clearance penalty (distance to nearest
-    obstacle) pushes the route toward corridor centres.  Returns a smoothed
-    [(x, y), ...] path, or [] if the goal is unreachable.
-    """
     rows, cols = binary_map.shape
     sx, sy = int(start[0]), int(start[1])
     gx, gy = int(goal[0]), int(goal[1])
 
-    # Clearance penalty: distance from each free cell to the nearest obstacle.
     dist_to_obs = distance_transform_edt(binary_map == 0)
     safe = ASTAR_SAFE_DISTANCE_PX
     penalty = np.where(
@@ -170,8 +130,6 @@ def _run_astar(binary_map, start, goal):
     return []
 
 
-# ── Public planner ────────────────────────────────────────────────────────────
-
 def _path_length_m(path):
     total = 0.0
     prev = mapping.map_to_world(path[0][0], path[0][1])
@@ -183,17 +141,6 @@ def _path_length_m(path):
 
 
 def plan(start_cell, goal_cell, grid=None, block_unknown=None, inflation_levels=None):
-    """Plan a route from start_cell to goal_cell (both (x, y) map cells).
-
-    Escalating inflation (inflation_levels): prefer the safest/widest clearance
-    that yields a path of at least PATH_MIN_LENGTH_M; otherwise return the longest
-    candidate found.  Returns a spline-smoothed [(x, y), ...] path, or [] if
-    unreachable at every inflation level.
-
-    block_unknown : None -> use PLAN_BLOCK_UNKNOWN (final goal-run: refuse UNKNOWN
-    so a path can never enter unmapped space).  Pass False for frontier-chasing,
-    where routing THROUGH unknown to reach the boundary is the whole point.
-    """
     if grid is None:
         grid = mapping.get_grid()
     if block_unknown is None:
@@ -211,24 +158,16 @@ def plan(start_cell, goal_cell, grid=None, block_unknown=None, inflation_levels=
         green_mask = (work == CELL_GREEN)
         unknown_mask = (work == CELL_UNKNOWN)
 
-        # Closures (floating walls) and green get the SAME hard-obstacle
-        # treatment as ordinary lidar-seen walls: marked OCC before inflation
-        # so they receive the identical dilation safety margin, instead of a
-        # bare, un-inflated single-cell block a path could run flush against.
         work[closed_mask] = CELL_OCC
         work[green_mask] = CELL_OCC
 
         work = _clean_small_components(work.astype(np.uint8), min_size=6, connectivity=4)
-        work = _remove_noisy_pixels(work, connectivity=4)   # -> binary 0/1
-        work = _inflate_obstacles(work, inflation)          # -> binary 0/1
+        work = _remove_noisy_pixels(work, connectivity=4)   
+        work = _inflate_obstacles(work, inflation)        
 
-        # Re-apply closures/green as hard obstacles after inflation (in case
-        # cleanup/binary conversion dropped a small isolated patch).
         work[closed_mask] = CELL_OCC
         work[green_mask] = CELL_OCC
 
-        # Only route through mapped-free space: block UNKNOWN so a path can never
-        # run into an unmapped wall (endpoint disks below still free start/goal).
         if block_unknown:
             work[unknown_mask] = CELL_OCC
 
@@ -250,11 +189,5 @@ def plan(start_cell, goal_cell, grid=None, block_unknown=None, inflation_levels=
 
 
 def plan_frontier(start_cell, goal_cell, grid=None):
-    """Exploration planner (ports the reference project's find_path_for_frontier).
-
-    Routes at a single inflation level (ASTAR_FRONTIER_INFLATION) and ALLOWS
-    UNKNOWN space — entering the unknown to reach the frontier boundary is the
-    point of exploration, unlike the final goal-run which refuses unknown.
-    """
     return plan(start_cell, goal_cell, grid=grid,
                 block_unknown=False, inflation_levels=[ASTAR_FRONTIER_INFLATION])
