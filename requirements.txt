@@ -1,0 +1,12 @@
+# Third-party Python dependencies for the RosBot maze controller.
+# Install into the Python interpreter that Webots uses to run
+# controllers/my_controller/my_controller.py:
+#     python -m pip install -r requirements.txt
+#
+# Not listed here: the `controller` module (Webots ships it) and the stdlib
+# modules used by the controller (math, heapq, struct, threading, time,
+# random, zlib, collections).
+
+numpy>=2.0
+scipy>=1.11
+opencv-python>=4.8
