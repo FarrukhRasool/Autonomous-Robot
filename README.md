@@ -1,11 +1,12 @@
 # Autonomous RosBot: Webots Maze Navigation
+
 ---
 
 ## 1. Overview
 
 This is a Webots controller that drives a Husarion RosBot through an unknown maze,
 finds a **blue cylindrical pillar**, drives to it, then finds and drives to a
-**yellow cylindrical pillar** — in that order — without ever driving over the
+**yellow cylindrical pillar**, in that order, without ever driving over the
 green "poison" ground patches, and without using the Webots Supervisor API or any
 privileged simulator state.
 
@@ -124,7 +125,7 @@ complexity:
 ### Control-flow model: blocking sub-loops
 
 `my_controller.py` has a conventional `while robot.step() != -1` loop for teleop.
-But the two autonomous modes — `E` (explore) and `X` (mission) — are **blocking**:
+But the two autonomous modes, `E` (explore) and `X` (mission), are **blocking**:
 `exploration.run()` and `mission.run()` call `devices.robot.step()` themselves
 inside their own nested `while` loops and do not return until finished or aborted.
 
@@ -152,7 +153,7 @@ works.
 There is **no build system**, no test framework, no linter config, no CI.
 
 `controllers/my_controller/venv/` is a committed Python 3.13.2 venv containing only
-`pip`. It is vestigial — the controller runs under Webots' own Python interpreter,
+`pip`. It is vestigial, the controller runs under Webots' own Python interpreter,
 not this venv. There is no `.gitignore`, so `__pycache__/*.pyc`, `.DS_Store`, and
 that venv are all tracked in git.
 
@@ -172,54 +173,54 @@ debug printout but are **not used by any control logic**. Only the inertial unit
 ## 4. Repository layout
 
 ```
-controllers/my_controller/     ← all real logic lives here
-  my_controller.py    (445)  Webots entry point. Main loop, keyboard dispatch,
+controllers/my_controller/  
+  my_controller.py           Webots entry point. Main loop, keyboard dispatch,
                              mode switching. Deliberately contains no sensor
                              math or navigation logic.
-  devices.py           (95)  The only Webots import. Creates Robot(), fetches and
+  devices.py                The only Webots import. Creates Robot(), fetches and
                              enables every device handle as a module global.
-  sensors.py          (647)  Device reads → clean data. HSV colour detection,
+  sensors.py                 Device reads → clean data. HSV colour detection,
                              pinhole ground projection of green pixels, per-pixel
                              projection of overhead/floating obstacles, lidar
                              point cloud, encoder/IMU scalars.
-  kinematics.py        (58)  Diff-drive inverse kinematics + saturation clamp.
+  kinematics.py              Diff-drive inverse kinematics + saturation clamp.
                              WHEEL_RADIUS_M=0.043, WHEEL_TRACK_M=0.18.
-  motion.py            (48)  drive_twist(v, ω) → four motor velocities.
-  localization.py     (183)  IMU-fused encoder odometry. Computes per-step
+  motion.py                 drive_twist(v, ω) → four motor velocities.
+  localization.py           IMU-fused encoder odometry. Computes per-step
                              (Δtranslation, Δrotation) and feeds slam.predict().
                              get_pose() returns the SLAM estimate, not dead
                              reckoning. Includes a gyro-vs-encoder slip gate.
-  slam.py             (475)  FastSLAM 2.0 particle filter + background thread.
-  pose_graph.py       (241)  Keyframes, correlative scan-match loop closure,
+  slam.py                   FastSLAM 2.0 particle filter + background thread.
+  pose_graph.py             Keyframes, correlative scan-match loop closure,
                              least_squares pose-graph optimisation, map rebuild.
-  mapping.py          (453)  Log-odds occupancy grid, Bresenham/DDA raycasting,
+  mapping.py                Log-odds occupancy grid, Bresenham/DDA raycasting,
                              cell-code semantics, green/overhead/pillar stamping,
                              PNG dump (pure stdlib zlib+struct).
-  perception.py       (129)  Pure geometry: body↔world transforms, and a
+  perception.py              Pure geometry: body↔world transforms, and a
                              persistent per-colour world-frame target memory.
-  planning.py         (260)  A* with clearance penalty + spline smoothing, over a
+  planning.py               A* with clearance penalty + spline smoothing, over a
                              morphologically cleaned, inflated binary grid.
-  following.py        (270)  DWA velocity sampling; plus a step-wise path
+  following.py              DWA velocity sampling; plus a step-wise path
                              follower used ONLY by the manual `Y` key.
-  exploration.py      (962)  Frontier detection/clustering/selection, the
+  exploration.py             Frontier detection/clustering/selection, the
                              blocking explore loop, recovery manoeuvres, the
                              live-lidar speed governor, the virtual bumper.
-  mission.py          (501)  Blue-then-yellow state machine; pillar registration
+  mission.py                Blue-then-yellow state machine; pillar registration
                              gate; the final visual-servo approach.
-  reactive.py         (138)  Laser 5-sector split + right-hand wall following.
+  reactive.py                Laser 5-sector split + right-hand wall following.
                              Used only by autonomous.py.
-  autonomous.py       (347)  LEGACY reactive wall-follower with its own, separate
+  autonomous.py              LEGACY reactive wall-follower with its own, separate
                              mission FSM. Reachable only via the `G` key.
-  safety.py           (138)  A safety-override layer that is NEVER IMPORTED.
+  safety.py                  A safety-override layer that is NEVER IMPORTED.
                              Dead code. See §8.
-  visualizer.py        (88)  Live cv2 map window. Degrades gracefully if the
+  visualizer.py              Live cv2 map window. Degrades gracefully if the
                              OpenCV build is headless.
-  sensor_debug.py     (277)  Console formatting for sensor snapshots.
-  config.py           (340)  Every tunable constant, heavily commented.
+  sensor_debug.py            Console formatting for sensor snapshots.
+  config.py                  Every tunable constant, heavily commented.
 
 worlds/Maze1..5.wbt        Five mazes. Each references controller "my_controller".
 protos/Wall{Short,Medium,Long}.proto
-                           Wall geometry protos that the worlds DO NOT USE — the
+                           Wall geometry protos that the worlds DO NOT USE, the
                            worlds inline raw `Solid { Box }` nodes instead. Dead.
 .claude/specs/001-rosbot-navigation.md
                            The requirements spec (FR1–FR12).
@@ -240,7 +241,7 @@ Read from the `.wbt` files, not assumed:
   Height is 0.3 m in Maze1, 0.4 m in Maze2 and Maze3, and **unspecified** in Maze4
   and Maze5 (so Webots' `Cylinder` default height of 2 m applies, with the solid
   sunk to `z ≈ -0.6` so only ~0.4 m protrudes).
-- **Green forbidden ground**: `Solid` nodes named `Poison`, `Poison(1)`, … — flat
+- **Green forbidden ground**: `Solid` nodes named `Poison`, `Poison(1)`, …, flat
   green boxes (e.g. `0.4 × 0.5 × 0.1` at `z = -0.04`, so the top sits ~flush with
   the floor). Counts: Maze1 ×1, Maze2 ×2, Maze3 ×8, Maze4 ×1, Maze5 ×2.
 - **Floating walls**: ordinary wall boxes translated upward, e.g. Maze1's
@@ -256,7 +257,7 @@ There is nothing to build.
 
 ```bash
 # 1. Install the three third-party deps into the interpreter Webots uses.
-#    (Not the committed controllers/my_controller/venv — that one is unused.)
+#    (Not the committed controllers/my_controller/venv, that one is unused.)
 python -m pip install -r requirements.txt
 
 # 2. Open a world in Webots R2025a:
@@ -313,7 +314,7 @@ external reference project** ("AURE", attributed in docstrings to *Hieu Tran et
 al.*). `slam.py`, `pose_graph.py`, `planning.py`, `following.py`, and
 `exploration.py` all say so explicitly, and several constants in `config.py` are
 annotated "verbatim from the reference CONSTANTS.py". The docstrings also record
-what was deliberately **not** ported — notably the reference's red-wall dead-end
+what was deliberately **not** ported, notably the reference's red-wall dead-end
 closure, rejected as maze-specific and therefore a violation of the generalisation
 constraint. I have not seen the reference; I am reporting what the code claims.
 
@@ -336,7 +337,7 @@ There is a **rotational wheel-slip gate**: if the encoder differential claims a 
 update is suppressed and `slam.predict(0.0, Δθ)` is called instead.
 
 Note the layering: `localization`'s own `_x/_y/_θ` are only a diagnostic dead-
-reckoning trace. `get_pose()` returns `slam.estimated_pose()` — the weighted mean of
+reckoning trace. `get_pose()` returns `slam.estimated_pose()`, the weighted mean of
 the particle cloud.
 
 ### SLAM (`slam.py`, `pose_graph.py`)
@@ -348,7 +349,7 @@ the particle cloud.
   model with noise `α₁..α₄ = 0.02, 0.02, 0.05, 0.01`.
 - *Measurement update* (`observe`, background thread, ~10 Hz, gated on not-turning
   **and** on having accumulated ≥3 cm of translation or ≥3° of rotation since the
-  last update — "update on motion, not on a clock"):
+  last update, "update on motion, not on a clock"):
   1. Downsample the scan to 45 beams.
   2. For each particle, build a likelihood field (`cv2.distanceTransform` over its
      own map's obstacle cells).
@@ -362,7 +363,7 @@ the particle cloud.
   6. Rasterise the scan into every surviving particle's map (vectorised DDA, which
      the comments note is ~50× faster than the per-beam Bresenham loop and releases
      the GIL).
-  7. Publish the map of the particle *nearest the weighted-mean pose* — not the
+  7. Publish the map of the particle *nearest the weighted-mean pose*, not the
      argmax-weight particle, because after refinement the weights are near-equal
      and argmax flickers between spatially different particles.
 
@@ -394,21 +395,21 @@ FREE`, untouched → `UNKNOWN`.
 Beyond lidar, three semantic marks are stamped and then **protected from sensor
 overwrite**:
 
-- `CELL_GREEN` (190) — green floor pixels, inverse-pinhole projected onto the floor
+- `CELL_GREEN` (190), green floor pixels, inverse-pinhole projected onto the floor
   plane assuming a camera height of 0.17 m, only from the bottom half of the image,
   only within 1.2 m.
-- `CELL_CLOSED` (200) — floating/overhead walls. The depth camera's upper band is
+- `CELL_CLOSED` (200), floating/overhead walls. The depth camera's upper band is
   projected per-pixel (each pixel keeps its own bearing, decomposed through the
   full pinhole ray), then **height-gated**: only points whose recovered real-world
   height is ≤ 0.20 m are kept, because a wall high enough to drive under should not
   be marked.
-- `CELL_BLUE` (100) / `CELL_YELLOW` (150) — pillar cells, once confirmed.
+- `CELL_BLUE` (100) / `CELL_YELLOW` (150), pillar cells, once confirmed.
 
 There is a genuinely clever cross-check here, in `_grid_from_log_odds` and
 `mark_overhead`: lidar physically *cannot* see a real floating wall, since it sits
 outside the scan plane. So if lidar log-odds independently confirm occupancy at a
-`CELL_CLOSED` cell, that cell was never a floating wall — it is an ordinary
-floor-to-ceiling wall the overhead band happened to clip — and lidar is allowed to
+`CELL_CLOSED` cell, that cell was never a floating wall, it is an ordinary
+floor-to-ceiling wall the overhead band happened to clip, and lidar is allowed to
 demote it to a normal `CELL_OCC`. A true floating wall's footprint stays FREE under
 lidar and so is never demoted.
 
@@ -421,7 +422,7 @@ image midline and only above an 8% area ratio.
 
 Range to a pillar is estimated the reference's way (`_estimate_column_distance_cm`):
 take the *far* depth over the colour mask, then subtract a known vertical leg via
-Pythagoras. **`COLUMN_HEIGHT_CM` is set to 125.0 cm — and no pillar in any of the
+Pythagoras. **`COLUMN_HEIGHT_CM` is set to 125.0 cm, and no pillar in any of the
 five worlds is anywhere near that tall** (they are 0.3–0.4 m of protruding
 cylinder). This is almost certainly an unadjusted leftover from the reference
 project's world. The code has independently discovered the consequence and
@@ -495,18 +496,18 @@ score = 4.0·heading + 3.5·distance_progress + 0.5·speed + 2.0·clearance
 ```
 
 Two details worth knowing. First, there is **no `v = 0` sample**, so the robot never
-pivots in place under DWA — it always creeps-and-steers, which is what keeps motion
+pivots in place under DWA, it always creeps-and-steers, which is what keeps motion
 smooth. Second, the body-clip penalty is applied to the **endpoint** clearance, not
 the rollout minimum. The comment explains why, and it is correct: the first rollout
 step is always at the robot's current position, so a min-over-rollout penalty is
-pinned by where the robot already *is* and is identical for every ω — no steering
+pinned by where the robot already *is* and is identical for every ω, no steering
 gradient. Endpoint clearance does vary with ω, so penalising it makes DWA curve back
 toward the corridor centre. It is a soft penalty, not a reject, so a uniformly tight
 corridor still yields the least-bad move rather than a stuck refusal.
 
 ### Safety, as actually wired
 
-This is the part most likely to be misread, so, concretely — during the `X` mission
+This is the part most likely to be misread, so, concretely, during the `X` mission
 and `E` exploration, obstacle safety comes from exactly three mechanisms, all in
 `exploration.py`:
 
@@ -525,7 +526,7 @@ and `E` exploration, obstacle safety comes from exactly three mechanisms, all in
 **Green avoidance in mission mode is purely map-mediated.** Green pixels get stamped
 as `CELL_GREEN`, which the planner promotes to an obstacle and which DWA's distance
 field treats as an obstacle. There is no reactive "green ahead, stop" reflex on this
-path. `safety.py` implements exactly such a reflex — and is never imported (§8).
+path. `safety.py` implements exactly such a reflex, and is never imported (§8).
 
 ### Mission (`mission.py`)
 
@@ -563,7 +564,7 @@ whether the route is genuinely blocked), then global replan.
 **The evidence here is qualitative, not measured.** There is no test suite, no
 benchmark harness, no evaluation script, no CI, and no recorded timings, success
 rates, or trajectory logs. What does exist is one occupancy-grid capture per maze,
-committed under `pics/`. They are screenshots, not data — but they are real output
+committed under `pics/`. They are screenshots, not data, but they are real output
 from real runs, and they show the system doing what §6 claims.
 
 ### One run per maze
@@ -577,7 +578,7 @@ registered pillars, **red line** = the planned A\* route, **red dot** = the robo
 | Maze 1 | Maze 2 |
 |---|---|
 | ![Maze 1](pics/Maze_1_Plan.png) | ![Maze 2](pics/Maze_2_Plan.png) |
-| The raw cv2 window, chrome included. Blue pillar registered; a long route loops the maze. | Blue **and** yellow both registered — a completed mission. Note the radial white streaks, which are lidar rays fanning through a doorway. |
+| The raw cv2 window, chrome included. Blue pillar registered; a long route loops the maze. | Blue **and** yellow both registered, a completed mission. Note the radial white streaks, which are lidar rays fanning through a doorway. |
 
 | Maze 3 | Maze 4 |
 |---|---|
@@ -589,7 +590,7 @@ registered pillars, **red line** = the planned A\* route, **red dot** = the robo
 | ![Maze 5](pics/Maze_5_Plan.png) |
 | Two green patches, matching the two `Poison` solids in `Maze5.wbt`. Sparse maze, mostly open floor. |
 
-`pics/` also holds a `Maze_N_Map.png` for each maze — the same grid without the
+`pics/` also holds a `Maze_N_Map.png` for each maze, the same grid without the
 window chrome. Only one image per maze is shown above.
 
 ### What these images do and do not prove
@@ -609,10 +610,10 @@ They *do* corroborate several claims independently of the code:
   going to guess.
 
 They *do not* establish: how long any run took, whether it was reproducible (it
-isn't — see §9 on unseeded RNG), how many attempts preceded the capture, or whether
+isn't, see §9 on unseeded RNG), how many attempts preceded the capture, or whether
 the robot ever touched green. A top-down grid cannot show a wheel crossing a cell.
 
-The remaining evidence is **git commit messages** — e.g. `947963b "navigaton thorugh
+The remaining evidence is **git commit messages**, e.g. `947963b "navigaton thorugh
 4 maze is now good and also solve simtime droping of goal state"` and `d6e4108
 "improved the obstacle avoidance in maze 4"`. That is weak: unversioned,
 unquantified, and the author's own claim. It does suggest cross-maze testing
@@ -641,17 +642,17 @@ is testable in principle from pure Python).
 
 ### Implemented but not exercised by the main path
 
-- **`following.step()`** — the step-wise path follower with its own progress
+- **`following.step()`**, the step-wise path follower with its own progress
   watchdog and recovery. Only the manual `Y` key uses it. The mission and
   exploration use `exploration._follow_local_target()` instead, which calls
   `following.dwa_velocity()` directly and implements its own stuck detection. Two
   parallel followers with two different stuck heuristics.
-- **`autonomous.py` + `reactive.py`** — a complete second mission state machine
+- **`autonomous.py` + `reactive.py`**, a complete second mission state machine
   (`SEEKING_BLUE`/`SEEKING_YELLOW`/`DONE`) built on right-hand wall following, with
   its own inline green/front/rear safety overrides. It shares no state with
   `mission.py`. Reachable only via `G`. This is legacy; the two FSMs will disagree.
 
-### Dead code — implemented, never invoked
+### Dead code: implemented, never invoked
 
 - **`safety.py`.** 138 lines implementing exactly the safety-override layer the
   spec asks for (front collision with latched escape, rear collision, green
@@ -661,7 +662,7 @@ is testable in principle from pure Python).
 - **The `T` self-test key.** Advertised in the startup banner and the module
   docstring. `test_timer` is never assigned a nonzero value.
 - **`reset_this_step`** in `my_controller.py`. Initialised to `False` at line 77,
-  read at lines 91 and 102, and only ever set `True` at line 146 — *after* both
+  read at lines 91 and 102, and only ever set `True` at line 146, *after* both
   reads. The guard is always true; the variable does nothing.
 - **`protos/Wall*.proto`.** The worlds inline raw `Solid { Box }` nodes and never
   instantiate these protos.
@@ -688,10 +689,10 @@ call. Expect a very noisy Webots console.
 
 - `slam.py`'s docstring says "Not wired into the control loop yet (that is a later
   milestone)." It is wired in; `localization.get_pose()` returns the SLAM estimate.
-- `config.py:23` says `OVERHEAD_MARK_ENABLED` is "TEMP: A/B test — disabled to
+- `config.py:23` says `OVERHEAD_MARK_ENABLED` is "TEMP: A/B test, disabled to
   isolate whether depth-based CELL_CLOSED marking is causing the replan/reverse
   thrash. Re-enable once confirmed." The value on that line is `True`.
-- `config.py:121-122` calls `CELL_CLOSED` and `CELL_GREEN` "reserved — later
+- `config.py:121-122` calls `CELL_CLOSED` and `CELL_GREEN` "reserved, later
   milestone". Both are fully used.
 
 ### Not implemented
@@ -709,7 +710,7 @@ reactively, and the reactive component that would back it up is the dead
 *(Inference, from reading `mission._drive_to`.)* When the pillar is visible and
 `_obstacle_in_front()` is false, the code `continue`s straight to a bearing-servo
 that ignores the occupancy grid entirely. `_obstacle_in_front()` consults only the
-range sensors and lidar — neither of which sees green paint. So if a green patch
+range sensors and lidar, neither of which sees green paint. So if a green patch
 lies between the robot and a visible pillar, nothing in that code path stops it.
 The map knows; the visual servo does not ask. I have not observed this happen; I am
 reporting that the guard is absent.
@@ -717,7 +718,7 @@ reporting that the guard is absent.
 **Green marking is narrow and fragile.** Only the bottom half of the RGB frame,
 only within 1.2 m, only ≥60 green pixels, only every 3rd tick, and only while not
 turning. It also assumes a camera height of 0.17 m and a forward offset of 0.03 m,
-both annotated "tune per robot" in `config.py` — i.e. **not verified against the
+both annotated "tune per robot" in `config.py`, i.e. **not verified against the
 actual RosBot proto.** A wrong camera height biases every projected green cell.
 The same 0.17 m is assumed independently for the overhead projection.
 
@@ -731,7 +732,7 @@ know that the memory position it is measured against was projected using this
 number.
 
 **The map is 10 m × 10 m, centred on the robot's start pose.** Maze2 spans roughly
-`y ∈ [0.4, 4.5]` in world coordinates, so it fits — but there is no bounds checking
+`y ∈ [0.4, 4.5]` in world coordinates, so it fits, but there is no bounds checking
 that would tell you if a larger maze silently ran off the grid.
 `mapping.there_is_obstacle()` treats out-of-bounds as blocked, which fails safe, but
 `world_to_map` will happily return out-of-range indices to other callers.
@@ -744,8 +745,8 @@ both. Nothing keeps them consistent.
 **The blocking sub-loops swallow the main loop.** While `mission.run()` or
 `exploration.run()` executes, the main `while robot.step()` loop is suspended and
 only the `should_continue()` callback runs. Any behaviour a reader expects from the
-main loop — the periodic `[POSE]` log, the `viz_on` render at
-`VIZ_PERIOD_STEPS` — is not happening during a mission; the callback re-implements
+main loop, the periodic `[POSE]` log, the `viz_on` render at
+`VIZ_PERIOD_STEPS`, is not happening during a mission; the callback re-implements
 the render. The `G`-mode autonomous step, by contrast, runs in the main loop.
 Two different execution models in one file.
 
@@ -756,7 +757,7 @@ reference. A genuine revisit occurring during a cooldown window will simply not 
 closed.
 
 **Resampling deep-copies 30 × 300 × 300 float32 maps** (`_resample`, via
-`log_odds.copy()`) — about 10.8 MB per resample event. It runs on the background
+`log_odds.copy()`), about 10.8 MB per resample event. It runs on the background
 thread, but it is not free, and it is proportional to particle count.
 
 **Determinism.** `exploration` uses the `random` module (unseeded) for recovery turn
