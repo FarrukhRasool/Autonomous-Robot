@@ -1,13 +1,4 @@
 # Autonomous RosBot: Webots Maze Navigation
-
-> **Accuracy note.** This README was written by reading the source. Where a claim
-> comes from something other than code (a comment, an inference, a guess), it is
-> marked. The repository's `CLAUDE.md` and `AGENTS.md` contain a "Current State"
-> section that is **badly out of date** — it describes a keyboard-teleop baseline
-> with "no odometry, mapping, perception, planning, or mission state machine yet."
-> That has not been true for a long time. Do not trust those files; trust this one
-> and the code.
-
 ---
 
 ## 1. Overview
