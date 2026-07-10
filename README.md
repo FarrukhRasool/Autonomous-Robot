@@ -772,13 +772,3 @@ thread, but it is not free, and it is proportional to particle count.
 directions and durations, frontier fallback sampling, and jittered centroids;
 `slam.predict` draws unseeded `np.random.normal` noise. Runs are not reproducible.
 Debugging a specific failure requires seeding both.
-
-**No `.gitignore`.** `__pycache__/*.pyc`, `.DS_Store`, and a 3.13.2 venv containing
-only `pip` are all committed.
-
-**The docs lie.** Restating it because it will cost the next person real time:
-`CLAUDE.md` and `AGENTS.md` both describe a teleop-only baseline with no autonomy,
-and both point at a spec directory (`docs/specs/`) that does not exist — the spec is
-at `.claude/specs/001-rosbot-navigation.md`. `AGENTS.md` is additionally a
-search-and-replaced copy of `CLAUDE.md` in which `.claude/commands/` became
-`.Codex/commands/`.
